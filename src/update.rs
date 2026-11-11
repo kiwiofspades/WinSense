@@ -211,7 +211,8 @@ pub fn tidy() {
     }
 }
 
-/// Wait (10 s at most) for the tray that started this one to end and let go of its lock.
+/// Wait (30 s at most: a slow Quit must not leave the new tray "already running") for the tray
+/// that started this one to end and let go of its lock.
 pub fn after(pid: &str) {
     use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject};
     const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -219,7 +220,7 @@ pub fn after(pid: &str) {
     unsafe {
         let h = OpenProcess(SYNCHRONIZE, 0, pid);
         if !h.is_null() {
-            WaitForSingleObject(h, 10_000);
+            WaitForSingleObject(h, 30_000);
             windows_sys::Win32::Foundation::CloseHandle(h);
         }
     }

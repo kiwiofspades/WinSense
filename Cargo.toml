@@ -1,6 +1,6 @@
 [package]
 name = "winsense"
-version = "0.17.0"
+version = "0.17.1"
 edition = "2024"
 description = "A Windows tray program for the PS5 DualSense controller"
 license = "MIT"
