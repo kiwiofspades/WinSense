@@ -539,6 +539,8 @@ enum Said<'a> {
     /// The touchpad mouse / the gyro mouse on or off.
     Touch(bool),
     Gyro(bool),
+    /// Couch mode on or off (the tray's own menu item).
+    Couch(bool),
 }
 
 const PLAY_PAUSE: u16 = 0xB3; // VK_MEDIA_PLAY_PAUSE
@@ -548,7 +550,7 @@ const PREVIOUS: u16 = 0xB1; // VK_MEDIA_PREV_TRACK
 /// Commands that are the same on every PC.
 // shortcut: "pause" and "play" both press the play/pause key, so "pause" while paused starts it; asking the player for its state (Windows' media session API) would fix that.
 // "turn on mouse" and "touchpad on" are there because "mouse on" scored only 0.72 in one of the two test voices (they scored 0.98).
-const FIXED: [(&str, Said<'static>); 26] = [
+const FIXED: [(&str, Said<'static>); 30] = [
     ("volume up", Said::Volume(true)),
     ("louder", Said::Volume(true)),
     ("volume down", Said::Volume(false)),
@@ -575,6 +577,10 @@ const FIXED: [(&str, Said<'static>); 26] = [
     ("turn on gyro", Said::Gyro(true)),
     ("gyro off", Said::Gyro(false)),
     ("turn off gyro", Said::Gyro(false)),
+    ("couch mode on", Said::Couch(true)),
+    ("turn on couch mode", Said::Couch(true)),
+    ("couch mode off", Said::Couch(false)),
+    ("turn off couch mode", Said::Couch(false)),
 ];
 
 /// The volume of the default playback device, which is what the volume keys change.
@@ -678,6 +684,14 @@ fn command(frames: &[u8]) -> Vec<u8> {
             // The same dings as the buttons give.
             Said::Touch(on) => Some(switch(&crate::mouse::TOUCH_ON, on, DING)),
             Said::Gyro(on) => Some(switch(&crate::mouse::GYRO_ON, on, DING2)),
+            // Through the tray's menu item, which also remembers it and ticks the menu; it flips, so only when it differs.
+            Said::Couch(on) => {
+                if crate::couch::ON.load(Ordering::Relaxed) != on {
+                    let h = unsafe { FindWindowW(w!("WinSenseTray"), PCWSTR::null()) }.ok()?;
+                    unsafe { PostMessageW(Some(h), WM_COMMAND, WPARAM(crate::tray::ID_COUCH), LPARAM(0)) }.ok()?;
+                }
+                Some(if on { DING } else { OFF })
+            }
             Said::Open(n) => launch(&app(n)?.1).then_some(OPENING),
             Said::Focus(n) => focus(window(n, &app(n)?.1)?).then_some(SWITCHING),
             // Asks the window to close, as its X button does: the app may still ask about unsaved work.
@@ -996,6 +1010,8 @@ mod tests {
             ("turn off controller", Said::Power),
             ("touchpad off", Said::Touch(false)),
             ("turn on gyro", Said::Gyro(true)),
+            ("couch mode on", Said::Couch(true)),
+            ("turn off couch mode", Said::Couch(false)),
         ] {
             assert_eq!(said(phrase), Some(want), "{phrase}");
         }
@@ -1027,7 +1043,7 @@ mod tests {
         let names: Vec<String> = apps().unwrap().into_iter().map(|a| a.0).collect();
         let all = phrases(&names, &[]);
         let taken = |frames: &[u8]| hear(&decode(frames).unwrap(), &all).unwrap().filter(|h| h.1 >= CONFIDENCE).map(|h| h.0);
-        let heard: [(&[u8], Said); 8] = [
+        let heard: [(&[u8], Said); 9] = [
             (include_bytes!("../assets/test_volume_up.frames"), Said::Volume(true)), // "Computer, volume up."
             (include_bytes!("../assets/test_mute.frames"), Said::Mute(true)),
             (include_bytes!("../assets/test_next.frames"), Said::Key(NEXT)),
@@ -1036,16 +1052,18 @@ mod tests {
             (include_bytes!("../assets/test_controller_off.frames"), Said::Power),
             (include_bytes!("../assets/test_gyro_on.frames"), Said::Gyro(true)),
             (include_bytes!("../assets/test_turn_on_mouse.frames"), Said::Touch(true)),
+            (include_bytes!("../assets/test_couch_on.frames"), Said::Couch(true)), // "Computer, couch mode on."
         ];
         for (frames, want) in heard {
             assert_eq!(taken(frames).as_deref().and_then(said), Some(want));
         }
-        let refused: [(&[u8], &str); 5] = [
+        let refused: [(&[u8], &str); 6] = [
             (include_bytes!("../assets/test_store.frames"), "I think we should go to the store later."),
             (include_bytes!("../assets/test_pausegame.frames"), "Can you pause the game for a second?"),
             (include_bytes!("../assets/test_greatplay.frames"), "That was a great play by the team."),
             (include_bytes!("../assets/test_playagain.frames"), "Play it again next week."),
             (include_bytes!("../assets/test_cute.frames"), "Cute."),
+            (include_bytes!("../assets/test_comfy.frames"), "The couch is so comfy."),
         ];
         for (frames, text) in refused {
             assert_eq!(taken(frames), None, "{text}");

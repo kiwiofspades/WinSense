@@ -24,7 +24,8 @@ everyone who worked them out.
 
 - The chimes and the `pickup`, `radio` and `levelup` sounds are synthesised by
   `assets/clips.py`.
-- The spoken replies were made with Microsoft's built-in Windows voice "Zira".
+- The spoken replies were made with the Kokoro-82M voice "Heart" (Apache-2.0, run once offline
+  through kokoro-onnx, MIT; see `assets/voice.py`).
 - `assets/alert.bin` is the alert sound from Konami's *Metal Gear Solid*. It belongs to Konami and
   is **not** covered by WinSense's MIT licence.
 

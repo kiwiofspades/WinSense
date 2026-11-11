@@ -203,6 +203,7 @@ You can start with a name or leave it out: "computer", "jarvis", "yo", "hey" or 
 | turn off controller, controller off | Turns the controller off |
 | mouse on/off, turn on/off mouse, touchpad on/off | Switches the touchpad mouse |
 | gyro on/off, turn on/off gyro | Switches the gyro mouse |
+| couch mode on/off, turn on/off couch mode | Switches couch mode, the same as its menu item |
 
 Only apps from the Start menu can be opened, and some are never offered: command prompts,
 PowerShell, system tools, installers, uninstallers and scripts.
