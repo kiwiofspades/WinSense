@@ -111,9 +111,9 @@ The keyboard does not open by itself when you click into a text box; press Squar
 
 ### Game sound as haptics
 
-Plays the low end (20 to 800 Hz: bass and the tune) of whatever Windows is playing in the
-controller's grips, so you feel explosions, bass and music. Loud parts are felt clearly stronger
-than quiet ones, and the stream keeps running through short pauses so no beat is lost. It needs the controller on Bluetooth. It stays quiet while anything
+Plays the bass and the tune (20 to 800 Hz) of whatever Windows is playing in the controller's
+grips, so you feel explosions, bass and music. Loud parts feel stronger than quiet ones, and it
+keeps going through short pauses in the sound. It needs the controller on Bluetooth. It stays quiet while anything
 drives the rumble motors (rumble wins), while you speak a voice command, and when the PC's sound
 plays through the controller itself.
 
