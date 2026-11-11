@@ -1,7 +1,7 @@
 """Synthesise the game clips for the mod port's `sound <name>` as wav files.
 
-Run: python assets/clips.py <out folder>, then for each wav the recipe in docs/modding.md ("Voice and
-sounds", Clips): ffmpeg to 200-byte Opus frames, then assets/ogg2frames.py to assets/<name>.bin.
+Run: python assets/clips.py <out folder>, then for each wav the recipe in docs/modding.md ("Making
+clips"): ffmpeg to 200-byte Opus frames, then assets/ogg2frames.py to assets/<name>.bin.
 Bell-like notes (a sine, a soft octave above, fast attack, exponential decay), like the dings.
 """
 import math, random, struct, sys, wave
