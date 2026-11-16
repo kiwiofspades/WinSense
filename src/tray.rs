@@ -72,6 +72,7 @@ static SHOWN: AtomicU32 = AtomicU32::new(u32::MAX);
 /// a dialog that is open.
 static UPDATES: AtomicBool = AtomicBool::new(false);
 static LAST_LOOK: AtomicU32 = AtomicU32::new(0);
+const RETRY: u32 = 15 * 60; // seconds before a failed update look is tried again
 static LOOKING: AtomicBool = AtomicBool::new(false);
 static LOOKED: Mutex<Option<(bool, Result<Option<crate::update::Release>, String>)>> = Mutex::new(None);
 static OFFER: Mutex<Option<crate::update::Release>> = Mutex::new(None);
@@ -223,11 +224,16 @@ fn look(manual: bool) {
         return;
     }
     LAST_LOOK.store(now(), Ordering::Relaxed);
-    if WIRED.load(Ordering::Relaxed) {
-        let _ = set_dword(w!("LastUpdateCheck"), now());
-    }
     std::thread::spawn(move || {
         let r = crate::update::check();
+        if r.is_ok() {
+            if WIRED.load(Ordering::Relaxed) {
+                let _ = set_dword(w!("LastUpdateCheck"), now());
+            }
+        } else {
+            // no network yet (logon) or GitHub down: look again in 15 minutes, not in 24 hours
+            LAST_LOOK.store(now().saturating_sub(24 * 3600 - RETRY), Ordering::Relaxed);
+        }
         *LOOKED.lock().unwrap() = Some((manual, r));
         LOOKING.store(false, Ordering::Relaxed);
     });

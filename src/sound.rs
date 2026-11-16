@@ -288,11 +288,14 @@ impl Stream {
         w[0] += !open as u32;
         w[1] += rumble as u32;
         w[2] += mic as u32;
-        if self.dry && now >= self.said {
+        if now >= self.said {
+            // reset every second also in the real tray, so the counters never wrap; only a dry tray prints them
             self.said = now + Duration::from_secs(1);
             let s = std::mem::replace(&mut self.feed.stats, Stats { qmin: usize::MAX, ..Default::default() });
-            let n = s.frames.max(1) as f64;
-            println!("dry stats: frames {} peak {:.3} rms {:.3} clipped {:.0}% gate-open {:.0}% takes {} starved {} queue {}..{} lulls {} waits gate/rumble/mic {:?}", s.frames, s.peak, (s.sum / n).sqrt(), 100.0 * s.clipped as f64 / n, 100.0 * s.open as f64 / n, s.takes, s.starved, if s.takes > 0 { s.qmin } else { 0 }, s.qmax, s.lulls, s.waits);
+            if self.dry {
+                let n = s.frames.max(1) as f64;
+                println!("dry stats: frames {} peak {:.3} rms {:.3} clipped {:.0}% gate-open {:.0}% takes {} starved {} queue {}..{} lulls {} waits gate/rumble/mic {:?}", s.frames, s.peak, (s.sum / n).sqrt(), 100.0 * s.clipped as f64 / n, 100.0 * s.open as f64 / n, s.takes, s.starved, if s.takes > 0 { s.qmin } else { 0 }, s.qmax, s.lulls, s.waits);
+            }
         }
         let play = self.cap.is_some() && open && !rumble && !mic;
         ACTIVE.store(play, Ordering::Relaxed);
