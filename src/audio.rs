@@ -1,7 +1,7 @@
 //! `winsense haptic`: the DualSense's real haptics are sound played on channels 3 and 4 (rear
 //! left/right) of its USB sound device "Speakers (DualSense Wireless Controller)"; channels 1
-//! and 2 feed its speaker and headphone jack (wine-devel 2022-07 and the DJm00n WASAPI gist;
-//! read). Played through winmm (shared mode): Windows mixes the stream into the
+//! and 2 feed its speaker and headphone jack (see the wine-devel discussion and the DJm00n WASAPI
+//! gist). Played through winmm (shared mode): Windows mixes the stream into the
 //! device's own format, so we refuse to play unless that format is 4 channels front+rear, where
 //! nothing of ours can be mixed into the speaker.
 
@@ -61,9 +61,8 @@ pub fn tone_bt(side: Side, hz: u32, level: u8, ms: u32) -> Vec<[i8; 2]> {
 }
 
 /// The notification tap (src/port.rs) as ONE stream: silence, a pulse, a gap, a pulse, at 80 Hz full
-/// strength; (lead, pulse, gap) in ms. Felt over Bluetooth, controller resting on a leg:
-/// two separate tones of 120 ms at 50 % = nothing, two of 200 ms at 100 % = only one, one of 1.5 s =
-/// felt. So each new stream loses its start (guess: the controller fills a buffer first); the
+/// strength; (lead, pulse, gap) in ms. Over Bluetooth, two separate tones of 120 ms at 50 % are
+/// not felt, two of 200 ms at 100 % give only one, and one of 1.5 s is felt. So each new stream loses its start (guess: the controller fills a buffer first); the
 /// silence in front takes that loss once, and the gap inside one stream is not lost.
 const TAP: (u32, u32, u32) = (LEAD, 150, 130);
 /// Silence in front of a tone that starts a stream, so the loss falls on it.
@@ -121,7 +120,7 @@ fn paced(devs: &[hidapi::HidDevice], n: usize, tail: usize, keep: &mut dyn FnMut
             let _ = devs.iter().try_for_each(|d| d.write(&make(n)).map(drop));
             break;
         }
-        let due = start + period * k as u32;
+        let due = start + Duration::from_nanos(period.as_nanos() as u64 * k as u64);
         let now = std::time::Instant::now();
         match due.checked_duration_since(now) {
             Some(wait) => std::thread::sleep(wait),
@@ -148,10 +147,6 @@ fn quad_format(blob: &[u8]) -> bool {
     let u16_at = |i: usize| blob.get(i..i + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
     let mask = blob.get(28..32).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     u16_at(8) == Some(WAVE_FORMAT_EXTENSIBLE) && u16_at(10) == Some(4) && mask == Some(QUAD)
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
 }
 
 /// A stream for the grips (game sound as haptics, src/sound.rs): `frames()` gives each report's
@@ -191,8 +186,8 @@ fn endpoints() -> impl Iterator<Item = (u32, String)> {
 /// The stored engine format of a playback endpoint ("{0.0.0.00000000}.{guid}").
 fn engine_format(endpoint: &str) -> Option<Vec<u8>> {
     let guid = endpoint.rsplit('.').next()?;
-    let key = wide(&format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{guid}\Properties"));
-    let value = wide("{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0");
+    let key = crate::ui::wide(&format!(r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render\{guid}\Properties"));
+    let value = crate::ui::wide("{f19f064d-082c-4e27-bc73-6882a1bb8e4c},0");
     let (mut buf, mut len) = (vec![0u8; 256], 256u32);
     let err = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_BINARY, null_mut(), buf.as_mut_ptr().cast(), &mut len) };
     (err == 0).then(|| buf[..len as usize].to_vec())

@@ -37,6 +37,9 @@ CLIPS = {
     "levelup": [note(1046.5, 0.0, 0.14), note(1318.5, 0.08, 0.14), note(1568.0, 0.16, 0.14), note(2093.0, 0.24, 0.32)],  # C6 E6 G6 C7
 }
 
+if len(sys.argv) != 2:
+    sys.exit("usage: python assets/clips.py <out folder>")
+
 for name, parts in CLIPS.items():
     total = max(int(at * RATE) + len(s) for at, s in parts)
     mix = [0.0] * total

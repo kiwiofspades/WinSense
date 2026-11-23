@@ -7,7 +7,11 @@ the beam pulses in the triggers once they are pulled past the first zone.
 import sys, time
 
 pipe = sys.argv[1] if len(sys.argv) > 1 else r"\\.\pipe\WinSense"
-with open(pipe, "w", buffering=1) as winsense:  # one line per game event; line-buffered sends each at once
+try:
+    winsense = open(pipe, "w", buffering=1)  # line-buffered: each line goes at once
+except OSError as e:
+    sys.exit(f"Could not open {pipe}: {e.strerror}. The WinSense tray must be running.")
+with winsense:
     winsense.write("beam\n")      # beam starts: both triggers pulse
     time.sleep(4)
     winsense.write("hit\n")       # the beam lands: a short rumble on top

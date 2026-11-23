@@ -64,7 +64,7 @@ fn centre(r: [i32; 4]) -> (i32, i32) {
 
 /// While alive, this thread sees real pixels. WinSense is only system DPI aware, so a side monitor
 /// at another scale gets stretched coordinates, but the Magnification API copies real pixels
-/// (measured on mixed 150 %/100 % monitors: a 1920x1080 side monitor read as 2880x1620).
+/// (on mixed 150 %/100 % monitors a 1920x1080 side monitor reads as 2880x1620).
 pub(crate) struct Physical(DPI_AWARENESS_CONTEXT);
 impl Physical {
     pub(crate) fn new() -> Self {
@@ -198,13 +198,13 @@ mod tests {
         // A portrait 1080x1920 monitor: centred, black bars left and right.
         let (r, k) = fit([2560, 0, 3640, 1920], [0, 0, 2560, 1440]);
         assert_eq!((r, k), ([(2560 - 810) / 2, 0, 810, 1440], 0.75));
-        // This PC: the primary is there, every number once.
+        // On the running machine: the primary is there, every number once.
         let all = monitors();
         assert_eq!(all.iter().filter(|m| m.2).count(), 1, "{all:?}");
         assert!(all.iter().enumerate().all(|(i, m)| all[..i].iter().all(|o| o.0 != m.0)));
     }
 
-    /// This PC's monitor rects as each DPI mode sees them:
+    /// The running machine's monitor rects as each DPI mode sees them:
     /// `cargo test monitor_rects -- --ignored --nocapture`.
     #[test]
     #[ignore]

@@ -1,4 +1,4 @@
-//! Battery and idle (0.11.0), for the tray: the charge for the tooltip and the menu, a warning
+//! Battery and idle, for the tray: the charge for the tooltip and the menu, a warning
 //! once per discharge, and "turn off when idle". Reads only: the mouse thread, which already
 //! reads every input report, feeds `Watch`; the tray looks at the statics once a second.
 //! Over Bluetooth the short report has no battery byte, so the charge stays unknown until a full

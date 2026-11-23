@@ -197,17 +197,14 @@ impl Drop for Pad {
 }
 
 /// Copy the first DualSense found into the pad until `stop`; looks again every second when
-/// none is there or it went away (then the pad is set to rest).
-// shortcut: one pad for the first DualSense found; a second controller needs a pad of its own (never paired yet).
+/// none is there or it went away (then the pad is set to rest). One pad serves the first
+/// DualSense found; a second controller would need a pad of its own.
 fn feed(bus: &Bus, serial: u32, stop: &AtomicBool) {
     let rest = xusb(&ds::State { sticks: [128; 4], buttons: [8, 0, 0], ..Default::default() });
-    let _ = bus.submit(serial, &rest); // a fresh pad read a stray stick offset until its first report (seen)
+    let _ = bus.submit(serial, &rest); // a fresh pad read a stray stick offset until its first report
     let mut last = rest;
     while !stop.load(Ordering::Relaxed) {
-        let found = hidapi::HidApi::new().ok().and_then(|api| {
-            let info = api.device_list().find(|d| d.vendor_id() == ds::VID && ds::PIDS.contains(&d.product_id()))?.clone();
-            Some((matches!(info.bus_type(), hidapi::BusType::Bluetooth), info.open_device(&api).ok()?))
-        });
+        let found = ds::open_first();
         let Some((bt, dev)) = found else {
             for _ in 0..10 {
                 if stop.load(Ordering::Relaxed) {
@@ -225,7 +222,13 @@ fn feed(bus: &Bus, serial: u32, stop: &AtomicBool) {
         }
         let mut buf = [0u8; 128];
         while !stop.load(Ordering::Relaxed) {
-            let Ok(len) = dev.read_timeout(&mut buf, 100) else { break };
+            let Ok(len) = dev.read_timeout(&mut buf, 100) else {
+                // Pause before looking again, but quit at once when asked to.
+                if !stop.load(Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                break;
+            };
             match ds::parse(bt, &buf[..len]) {
                 Some((ds::Kind::BtFull { crc_ok: false }, _)) | None => {}
                 Some((_, s)) => {

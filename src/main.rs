@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 
 /// Print to the console the command was started from. With output redirected (pipes, files)
 /// the handles are already there and stay; only a bare console start needs attaching.
-// shortcut: PowerShell and cmd do not wait for a Windows program, so the prompt comes back first; pipe to Out-Host (or `| more`) to wait.
+// PowerShell and cmd do not wait for a Windows program, so the prompt comes back first; pipe to Out-Host (or `| more`) to wait.
 fn console() {
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::*;
@@ -83,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let trig = if cmd == "trigger" { parse_trigger(&args) } else { None };
     let rumble = if cmd == "rumble" { parse_rumble(&args) } else { None };
     if cmd == "haptic" && let Some((side, hz, level, ms)) = parse_haptic(&args) {
-        // Bluetooth first: with the cable and Bluetooth both up, the cable's sound is not felt (measured).
+        // Bluetooth first: with the cable and Bluetooth both up, the cable's sound is not felt.
         let api = HidApi::new()?;
         let bt: Vec<_> = api
             .device_list()
@@ -146,14 +146,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if cmd != "look" && cmd != "full" && lights.is_none() && trig.is_none() && rumble.is_none() {
         eprintln!("usage: winsense                  the tray program (no console window); `winsense tray --dry` prints instead of moving the mouse or writing
-       winsense look [seconds]   listen only\n       winsense pad [seconds]    virtual Xbox 360 pad (needs ViGEmBus) fed from the DualSense, read back through XInput; sends nothing to the controller (game rumble is only printed)
-       winsense mouse [seconds] [--dry]   the touchpad as the Windows mouse until closed (or for seconds); reads only, sends nothing to the controller. Bluetooth: starts at a long press on the touchpad (that switches to the full report). Slide = move, click = left, two-finger click = right, a long press toggles it. While a finger rests on the pad: R2 = left click, L2 = right click. --dry prints instead of moving the cursor
+       winsense look [seconds]   listen only\n       winsense pad [seconds]    virtual Xbox 360 pad (needs ViGEmBus) fed from the DualSense, read back through XInput; reads only (game rumble is only printed); the calibration request switches Bluetooth to the full report
+       winsense mouse [seconds] [--dry]   the touchpad as the Windows mouse until closed (or for seconds); reads only; the calibration request switches Bluetooth to the full report, so over Bluetooth it starts at a long press on the touchpad. Slide = move, click = left, two-finger click = right, a long press toggles it. While a finger rests on the pad: R2 = left click, L2 = right click. --dry prints instead of moving the cursor
        winsense ui [--dry|--pad] trigger test screen; --pad also runs the virtual Xbox 360 pad (needs ViGEmBus; games then see a second pad unless HidHide hides the DualSense), with game rumble. WRITES to every DualSense on each change, switches both triggers off on close (--dry: opens no controller, prints the reports)\n       winsense trigger <l2|r2|both> off | resist <start 0-9> <strength 1-8> | click <start 2-7> <end, up to 8> <strength 1-8> | vibrate <start 1-9> <strength 1-8> <hz 1-255> | curve <start 0-9> <strength 1-8 per zone...> | rigid <raw start 0-255> <force 0-255>  [power 0-7]\n                                 WRITES to every DualSense. Positions: 0 released, 9 fully pulled (rigid: raw, about 176 = fully pulled). power = trigger power reduction (0 full force, 7 weakest; never tried on the controller; `off` does not reset it). The effect stays until `off`\n       winsense full             ask for the calibration report (Bluetooth: switches to the full report until reconnect)\n       winsense light <r> <g> <b> [player-mask 0-31] [mute 0|1|2] [dim 0|1|2]   WRITES to every DualSense: light bar; player lights, mute light (2 = pulse) and small-light brightness (0 bright, 2 dim; dims the mute light too) only if given. Bluetooth: any write switches to the full report until reconnect\n       winsense light off        give the lights back to the controller (cable: its orange charging pulse; Bluetooth: all dark)
        winsense rumble <left 0-255> <right 0-255> [ms 1-5000]   WRITES to every DualSense: left = strong motor, right = weak; stops by itself after ms (default 1000)
        winsense rumble off       stop rumble (if a run was killed before its stop)
-       light and trigger end a running rumble (each report carries the whole rumble state, and they send none)
+       light and trigger commands stop a running rumble: each report carries the rumble state too, and theirs leaves it off
        winsense haptic <left|right|both> <hz 1-1000> <level 1-100> [ms 1-5000]   over Bluetooth: haptic samples in report 0x32; otherwise PLAYS SOUND to the DualSense's sound device on the cable, rear channels = haptics, refused unless Windows treats it as 4-channel
-       winsense mic <secs 1-30> <file>   Bluetooth: OPENS the controller's mic, keeps the raw Opus mic frames in <file>, closes it");
+       winsense mic <secs 1-30> <file>   Bluetooth: OPENS the controller's mic, keeps the raw Opus mic frames in <file>, closes it
+       winsense osk [shift] [sym] [demo]   the on-screen keyboard alone for 30 s (for screenshots); types nothing
+       winsense --version        print the version (also `version`)");
         std::process::exit(2);
     }
     // WINSENSE_ONLY=usb|bt: use one connection when the same controller is on both.
@@ -273,11 +275,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let got = dev.get_feature_report(&mut f);
                     let long = matches!(got, Ok(len) if len >= 46);
                     match got {
-                        // Bluetooth feature reports end in a CRC seeded with 0xA3.
-                        Ok(len) if bt && len >= 5 => println!(
-                            "{tag} {name} report: {len} bytes, checksum ok: {}",
-                            ds::crc32(0xA3, &f[..len - 4]) == u32::from_le_bytes(f[len - 4..len].try_into().unwrap())
-                        ),
+                        Ok(len) if bt && len >= 5 => println!("{tag} {name} report: {len} bytes, checksum ok: {}", ds::feature_crc_ok(&f[..len])),
                         Ok(len) => println!("{tag} {name} report: {len} bytes"),
                         Err(e) => println!("{tag} {name} report failed: {e}"),
                     }
@@ -310,11 +308,11 @@ fn pad_check(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             let mut x: XINPUT_STATE = unsafe { std::mem::zeroed() };
             if unsafe { XInputGetState(slot, &mut x) } == 0 {
                 let g = x.Gamepad;
-                now.push(format!("slot {slot}: buttons {:04x} LT {} RT {} L ({}, {}) R ({}, {})", g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY));
+                now.push((slot, format!("slot {slot}: buttons {:04x} LT {} RT {} L ({}, {}) R ({}, {})", g.wButtons, g.bLeftTrigger, g.bRightTrigger, g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY)));
             }
         }
         // Act as a game at 1 s and 2 s: rumble 100/200 on the first XInput pad, then 0/0 (printed by the pad, never sent on).
-        if (t == 2 || t == 4) && let Some(slot) = now.first().and_then(|l| l[5..6].parse::<u32>().ok()) {
+        if (t == 2 || t == 4) && let Some(&(slot, _)) = now.first() {
             let v = if t == 2 { XINPUT_VIBRATION { wLeftMotorSpeed: 100 << 8, wRightMotorSpeed: 200 << 8 } } else { XINPUT_VIBRATION { wLeftMotorSpeed: 0, wRightMotorSpeed: 0 } };
             println!("XInputSetState slot {slot}: left {} right {}", v.wLeftMotorSpeed >> 8, v.wRightMotorSpeed >> 8);
             unsafe { XInputSetState(slot, &v) };
@@ -325,7 +323,7 @@ fn pad_check(secs: u64) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         if now != last {
-            println!("{:5.1}s {}", t as f32 / 2.0, if now.is_empty() { "no XInput pad".into() } else { now.join(" | ") });
+            println!("{:5.1}s {}", t as f32 / 2.0, if now.is_empty() { "no XInput pad".into() } else { now.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join(" | ") });
             last = now;
         }
         std::thread::sleep(Duration::from_millis(500));

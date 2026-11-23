@@ -4,8 +4,7 @@
 //! touchpad click = left, with two fingers down = right. A long press on the touchpad (finger
 //! still) toggles it, with a ding from the controller's speaker (src/voice.rs). Steam Deck style:
 //! R2 = left click, L2 = right click, but only while a finger rests on the touchpad,
-//! so in a game the triggers stay triggers. (The gyro mouse was removed; the
-//! motion data is still parsed in ds.rs for the mod port.)
+//! so in a game the triggers stay triggers. The motion data is parsed in ds.rs for the mod port.
 //! Over Bluetooth it waits on the short report until the touchpad is held down (or a full report
 //! shows someone else already switched it), because the switch blinds plain readers until the
 //! controller is turned off and on (SDL also switches only on demand).
@@ -151,14 +150,11 @@ fn send(out: &[Act]) {
 
 /// Read the first DualSense and drive the cursor until `stop`; looks again every second when
 /// none is there or it went away. `dry` prints instead of moving the cursor.
-// shortcut: the first DualSense found only; a second controller would need its own Mouse.
+/// Only the first DualSense found is used; a second controller would need its own Mouse.
 pub fn run(stop: &AtomicBool, dry: bool) {
     while !stop.load(Ordering::Relaxed) {
         crate::power::gone(); // battery and idle time (src/power.rs) start over with each connection
-        let found = hidapi::HidApi::new().ok().and_then(|api| {
-            let info = api.device_list().find(|d| d.vendor_id() == ds::VID && ds::PIDS.contains(&d.product_id()))?.clone();
-            Some((matches!(info.bus_type(), hidapi::BusType::Bluetooth), info.open_device(&api).ok()?))
-        });
+        let found = ds::open_first();
         let Some((bt, dev)) = found else {
             STATE.store(0, Ordering::Relaxed);
             std::thread::sleep(Duration::from_secs(1));
@@ -191,10 +187,10 @@ pub fn run(stop: &AtomicBool, dry: bool) {
         }
         STATE.store(2, Ordering::Relaxed);
         // The calibration request (not a write) also switches Bluetooth to the full report. Its
-        // numbers are only printed now (they were the gyro mouse's); a mod's motion channel may use them.
+        // numbers are only printed; a mod's motion channel may use them.
         let mut f = [0u8; 64];
         f[0] = 0x05;
-        let cal = dev.get_feature_report(&mut f).ok().filter(|&len| !bt || (len >= 41 && ds::crc32(0xA3, &f[..len - 4]) == u32::from_le_bytes(f[len - 4..len].try_into().unwrap())));
+        let cal = dev.get_feature_report(&mut f).ok().filter(|&len| !bt || (len >= 41 && ds::feature_crc_ok(&f[..len])));
         let (scale, bias) = if cal.is_some() { calibration(&f[..41]) } else { calibration(&[]) };
         let mut m = Mouse::new();
         if hold.fired {
@@ -215,7 +211,7 @@ pub fn run(stop: &AtomicBool, dry: bool) {
             let s = match ds::parse(bt, &buf[..len]) {
                 Some((ds::Kind::Usb | ds::Kind::BtFull { crc_ok: true }, s)) => s,
                 // Back on the short report with the link still up: the mouse needs the touchpad,
-                // but couch mode keeps working (it used to go dead here).
+                // but couch mode keeps working.
                 Some((ds::Kind::BtSimple, s)) => {
                     watch.feed(&s);
                     couch.feed(&s);
@@ -289,7 +285,7 @@ mod tests {
         assert_eq!(m.step(&st(PAD_CLICK, two, [0; 3], 2 * TICK)), vec![Act::Button { right: true, down: true }]);
         assert_eq!(m.step(&st(0, two, [0; 3], 3 * TICK)), vec![Act::Button { right: true, down: false }]);
         let with = |b1: u8, b2: u8, i: u32| ds::State { buttons: [8, b1, b2], touch: one, imu: Some(([0; 3], [0, 8192, 0], i * TICK)), ..Default::default() };
-        // Create + click is nothing special since the gyro mouse went: just a click.
+        // Create + click is nothing special: just a click.
         assert_eq!(m.step(&with(0x10, PAD_CLICK, 4)), vec![Act::Button { right: false, down: true }]);
         assert_eq!(m.step(&with(0x10, 0, 5)), vec![Act::Button { right: false, down: false }]);
         m.step(&with(0, 0, 8));

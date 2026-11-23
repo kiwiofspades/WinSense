@@ -1,12 +1,13 @@
 # WinSense user guide
 
 WinSense runs in the tray. Click its icon (left or right button) to open the menu. This guide goes
-through the menu from top to bottom, then the controller's buttons, voice commands and the test
-commands.
+through the menu from top to bottom, then covers Bluetooth, voice commands, the controller's
+sounds and the test commands.
 
 On from the start: the touchpad mouse, voice commands on hold-Mute, the mod port, the low-battery
 balloon and the daily update check. Off until you tick them: couch mode, game sound as haptics,
-the mute light, the notification buzz, hands off, turn off when idle and start with Windows.
+the mute light, the notification buzz, "Hands off the controller while a game is in front", turn
+off when idle and start with Windows.
 WinSense remembers those ticks (per Windows user, under `HKEY_CURRENT_USER\Software\WinSense`).
 The touchpad mouse is on again each time WinSense starts.
 
@@ -23,7 +24,7 @@ and the long report" below). Until then the line says "Battery shows after you h
 down". On the cable it always shows.
 
 When the charge falls to about 25% while on battery, a balloon says so once. It warns again only
-after the controller has been charging.
+after the controller has been charging, or the charge has come back up to about 45%.
 
 ### Trigger test screen
 
@@ -50,9 +51,9 @@ WinSense switches off whatever it set when you close the screen or quit.
 ### Touchpad mouse
 
 Ticks or unticks the touchpad mouse; it is ticked when WinSense starts. On the cable it works at
-once. Over Bluetooth it starts working after you hold a finger still on the touchpad for about half
-a second, and a chime from the controller's speaker confirms it. After that the same long press
-switches it off and on.
+once. Over Bluetooth it starts working after you press the touchpad down and keep it down, finger
+still, for about 0.6 seconds, and a chime from the controller's speaker confirms it. After that the
+same long press switches it off and on.
 
 While it is on:
 
@@ -117,9 +118,9 @@ The keyboard does not open by itself when you click into a text box; press Squar
 
 Plays the bass and the tune (20 to 800 Hz) of whatever Windows is playing in the controller's
 grips, so you feel explosions, bass and music. Loud parts feel stronger than quiet ones, and it
-keeps going through short pauses in the sound. It needs the controller on Bluetooth. It stays quiet while anything
-drives the rumble motors (rumble wins), while you speak a voice command, and when the PC's sound
-plays through the controller itself.
+keeps going for 5 seconds after the sound stops, so short pauses do not restart it. It needs the
+controller on Bluetooth. It stays quiet while anything drives the rumble motors (rumble wins),
+while you speak a voice command, and when the PC's sound plays through the controller itself.
 
 While it is ticked, WinSense may show up in Windows' volume mixer. It only listens; it plays
 nothing there.
@@ -137,15 +138,17 @@ Two short taps in the grips when Windows shows a new notification, at most one b
 seconds. It does not buzz while a game is in front (the same test as couch mode), while you speak
 a voice command, or, over Bluetooth, before the controller is on the long report. Apps that do not
 send Windows notifications (for example Discord with its notifications off) cannot make it buzz.
-It also buzzes while Windows' do-not-disturb hides the banners.
+Limit: it reads Windows' list of notifications, so it still buzzes while do-not-disturb hides the
+banners. Windows must let WinSense see notifications (Settings > Privacy & security >
+Notifications); if it does not, a balloon says so.
 
 ### Hands off the controller while a game is in front
 
 While a game is in front (the same test as couch mode), WinSense sends nothing at all to the
 controller: no trigger effects, rumble, lights, haptics or sounds. Use it for games that drive the
-DualSense themselves, so the two do not fight. Within a second of the game leaving the front, WinSense sends its own state again
-(only if it had sent anything before, or something asked for a change meanwhile). Off unless ticked.
-New in 0.18.0.
+DualSense themselves, so the two do not fight. Within a second of the game leaving the front,
+WinSense sends its own state again (only if it had sent anything before, or something asked for a
+change meanwhile). Off unless ticked. New in 0.18.0.
 
 ### Turn controller off
 
@@ -157,8 +160,7 @@ No administrator rights are needed.
 Turns a Bluetooth controller off after 10 minutes without input. Input means a button, a stick or
 trigger moved, a finger on the touchpad, or the controller being moved. A mod sending effects, an
 effect left on in the test screen, game sound being played in the grips, or a game holding the
-controller (see Hands off) also count as use. A
-controller on the cable is left on.
+controller (see Hands off) also count as use. A controller on the cable is left on.
 
 ### Start with Windows
 
@@ -166,10 +168,11 @@ Starts WinSense when you log on (a per-user Run entry; no administrator rights).
 
 ### Check for updates
 
-Asks GitHub whether a newer release is out. WinSense also does this when it starts and at most
-once a day. When there is one, it asks you first. Only after you say yes does it download the new
-exe, check it against the SHA-256 published with the release, put it in place of the old one and
-restart. If anything goes wrong, the old exe stays as it was.
+Asks GitHub whether a newer release is out; each check reads only the latest release's details.
+WinSense also checks when it starts, if the last check was more than a day ago, and about once a
+day while it runs. When there is one, it asks you first. Only after you say yes does it download
+the new exe, check it against the SHA-256 published with the release, put it in place of the old
+one and restart. If anything goes wrong, the old exe stays as it was.
 
 ### Quit
 
@@ -197,7 +200,7 @@ mouse, open the test screen, or when a mod or a feature sends something to the c
 ## Voice commands
 
 Voice works over Bluetooth only, because the mic audio arrives in the controller's own reports.
-Hold **Mute** for about half a second. A chime plays, then the mic opens. Say the command while
+Hold **Mute** for about 0.4 seconds. A chime plays, then the mic opens. Say the command while
 you keep holding Mute (up to 8 seconds), then let go. WinSense answers through the controller's
 speaker. Recognition runs on the PC with Windows' own speech engine; nothing is sent anywhere.
 
@@ -252,4 +255,5 @@ list. The ones that write to the controller refuse while the tray runs.
 | `winsense light 0 0 255` | A blue light bar. `winsense light off` gives the lights back. |
 
 PowerShell and Command Prompt do not wait for a Windows program to finish, so the prompt may come
-back before the output. Add `| more` to wait.
+back before the output. In PowerShell add `| Out-Host` to wait; in Command Prompt add
+`| more`.

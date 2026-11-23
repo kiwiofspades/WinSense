@@ -230,7 +230,7 @@ fn paint(h: HWND) {
                     }
                 }
             }
-            let hint = "Cross type | Square delete | Triangle space | L1 shift | R1 symbols | R2 enter | Circle close";
+            let hint = "Cross type | Square backspace | Triangle space | L1 shift | R1 symbols | R2 enter | Circle close";
             ui::text_with(mem, f[1], hint, (PAD, H - 30.0, W - 2.0 * PAD, 22.0), th.text2, DT_CENTER);
         });
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);

@@ -33,7 +33,7 @@ pub static IN_FRONT: Mutex<String> = Mutex::new(String::new());
 /// Voice said "couch mode on" while it already was: start afresh (this lifts a pause).
 pub static FRESH: AtomicBool = AtomicBool::new(false);
 
-// All first guesses, not tried in the hand.
+// Starting values; change them if the feel is wrong.
 /// Stick travel (of 1.0) that counts as rest.
 const DEAD: f32 = 0.12;
 /// Cursor pixels per second at full tilt; the curve is tilt squared, so half tilt is a quarter of it.
@@ -180,7 +180,7 @@ impl Couch {
         let hit = |i: usize, m: u8| b[i] & m != 0 && was[i] & m == 0;
         let mut out = Vec::new();
         // Create held for a second: pause / resume. Not while a game is in front: games use a held
-        // Create (map, scores, emulator hotkeys), and that used to pause couch mode unseen.
+        // Create (map, scores, emulator hotkeys), and a pause there would go unseen.
         if b[1] & CREATE == 0 {
             self.hold = 0.0;
         } else if gate {
@@ -300,8 +300,8 @@ pub fn reason(q: Quiet, exe: &str) -> String {
 /// Browsers: a fullscreen video still wants Escape and the cursor, and a page that once used the
 /// gamepad leaves XInput loaded for good, so only a controller they hold open right now counts.
 const BROWSERS: &[&str] = &["chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "opera.exe", "vivaldi.exe", "zen.exe"];
-/// Modules only a controller reader loads (prefixes, lower case). MEASURED on a whole PC
-/// (2026-11-22, 388 processes): xinput and dinput8 only in steam.exe, XboxService and WinSense,
+/// Modules only a controller reader loads (prefixes, lower case). Checked across all running
+/// processes of one machine: xinput and dinput8 were only in steam.exe, XboxService and WinSense,
 /// gameinput only in Xbox services. hid.dll, SDL and Windows.Gaming.Input are no sign: Explorer,
 /// iCUE and Steam's web helper load them and read no controller.
 const PAD_DLLS: &[&str] = &["xinput", "dinput8.dll", "dinput.dll", "gameinput"];
@@ -343,6 +343,7 @@ fn dirs() -> &'static (String, String) {
 
 /// What was last found about the window in front.
 struct Seen {
+    hwnd: isize,
     pid: u32,
     exe: String,
     fullscreen: bool,
@@ -361,23 +362,29 @@ static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
 /// A program that comes to the front is looked at at once (a few ms), so nothing is let go or
 /// missed on a switch. After that its window is looked at 4 times a second and inside it 4 times
 /// a second for its first 3 seconds (a game may open the controller after its window shows),
-/// then every 2 seconds. Between looks this is a lock and two small calls.
+/// then every 2 seconds. Between looks this is `GetForegroundWindow`, a lock and a copy of the
+/// program's file name; the window's owner is asked only on a look, not on every report.
 pub(crate) fn front() -> (Option<Quiet>, String) {
     use windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     let h = unsafe { GetForegroundWindow() };
-    let pid = if h.is_null() { 0 } else { look::owner(h) };
-    if pid == 0 || pid == std::process::id() {
+    if h.is_null() {
         return (None, String::new());
     }
+    let hwnd = h as isize;
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     let now = Instant::now();
-    let same = seen.as_ref().is_some_and(|s| s.pid == pid);
-    if !same || seen.as_ref().is_some_and(|s| s.looked.elapsed() >= Duration::from_millis(250)) {
-        let (exe, fullscreen) = look::window(h);
+    // A new window is looked at at once; the same one every 250 ms. The owner is asked again on
+    // each look too, because a Store app's window can get its inner window after it shows.
+    if seen.as_ref().is_none_or(|s| s.hwnd != hwnd || s.looked.elapsed() >= Duration::from_millis(250)) {
+        let pid = look::owner(h);
+        if pid == 0 || pid == std::process::id() {
+            return (None, String::new());
+        }
+        let (exe, fullscreen) = look::window(h, pid);
         match seen.as_mut() {
             // The same program (a pid used again by a new program has another path).
-            Some(s) if same && s.exe == exe => (s.fullscreen, s.looked) = (fullscreen, now),
-            _ => *seen = Some(Seen { pid, exe, fullscreen, reads: Some(false), came: now, looked: now, inside: None, stuck: false }),
+            Some(s) if s.pid == pid && s.exe == exe => (s.hwnd, s.fullscreen, s.looked) = (hwnd, fullscreen, now),
+            _ => *seen = Some(Seen { hwnd, pid, exe, fullscreen, reads: Some(false), came: now, looked: now, inside: None, stuck: false }),
         }
     }
     let s = seen.as_mut().expect("set above");
@@ -388,11 +395,11 @@ pub(crate) fn front() -> (Option<Quiet>, String) {
             Some(false)
         } else {
             // On a thread of its own: a device Windows never answers about would otherwise freeze
-            // the mouse thread. Measured looks take 2-17 ms; one that takes 500 ms counts as "cannot
+            // the mouse thread. Looks take 2-17 ms; one that takes 500 ms counts as "cannot
             // be looked into" for as long as that program stays in front, and is not tried again
             // (its thread is left waiting, one per such program).
             let (tx, rx) = std::sync::mpsc::channel();
-            let browser = browser(&s.exe);
+            let (pid, browser) = (s.pid, browser(&s.exe));
             std::thread::spawn(move || tx.send(look::reads(pid, browser)));
             rx.recv_timeout(Duration::from_millis(500)).unwrap_or_else(|_| {
                 s.stuck = true;
@@ -449,8 +456,8 @@ mod look {
     }
 
     /// The window's program's full path ("" if unreadable) and whether the window is fullscreen
-    /// (covers its whole monitor with no title bar).
-    pub fn window(h: HWND) -> (String, bool) {
+    /// (covers its whole monitor with no title bar). `pid` = `owner(h)`.
+    pub fn window(h: HWND, pid: u32) -> (String, bool) {
         use windows_sys::Win32::Graphics::Gdi::*;
         use windows_sys::Win32::UI::WindowsAndMessaging::*;
         unsafe {
@@ -464,7 +471,7 @@ mod look {
             // than a quiet couch mode.
             let fullscreen = r.left <= m.left && r.top <= m.top && r.right >= m.right && r.bottom >= m.bottom && GetWindowLongW(h, GWL_STYLE) as u32 & WS_CAPTION != WS_CAPTION;
             let (mut path, mut len) = ([0u16; 520], 520u32);
-            let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner(h));
+            let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if p.is_null() || QueryFullProcessImageNameW(p, 0, path.as_mut_ptr(), &mut len) == 0 {
                 len = 0;
             }
@@ -514,9 +521,10 @@ mod look {
         (!v.is_empty()).then_some(v)
     }
 
-    /// The process's WebView2 children: an app built on WebView2 (RetroShelf is) reads the gamepad
-    /// in its msedgewebview2.exe. Not every child: MEASURED, Explorer then "read the controller"
-    /// through Steam and WinSense it had started, and any launcher would too.
+    /// The process's WebView2 children: an app built on WebView2 reads the gamepad in its
+    /// msedgewebview2.exe. Only these children count, not every child: counting all of them made
+    /// Explorer "read the controller" through the programs it had started (Steam, WinSense), and
+    /// any launcher would too.
     fn webviews(pid: u32) -> Vec<u32> {
         use windows::Win32::System::Diagnostics::ToolHelp::*;
         let mut v = Vec::new();
@@ -636,8 +644,8 @@ mod look {
                     if DuplicateHandle(p, e.handle as HANDLE, GetCurrentProcess(), &mut d, 0, 0, DUPLICATE_SAME_ACCESS) == 0 {
                         return false;
                     }
-                    // Devices only. Asking a pipe its name can hang until someone writes to it (MEASURED:
-                    // 12 handles of one Electron app never answered); asking its type answered at once, and a
+                    // Devices only. Asking a pipe its name can hang until someone writes to it (12 handles of
+                    // one Electron app never answered); asking its type answers at once, and a
                     // controller is "unknown" there, a pipe or a file is not.
                     let hit = GetFileType(d) == FILE_TYPE_UNKNOWN && name(d).is_some_and(|n| pads.contains(&n));
                     CloseHandle(d);
@@ -706,11 +714,13 @@ pub struct Runner {
     t: Instant,
     dry: bool,
     live: bool,
+    /// The program and verdict `IN_FRONT` was last built for.
+    told: Option<(Quiet, String)>,
 }
 
 impl Runner {
     pub fn new(dry: bool) -> Runner {
-        Runner { c: Couch::default(), t: Instant::now(), dry, live: false }
+        Runner { c: Couch::default(), t: Instant::now(), dry, live: false, told: None }
     }
 
     /// One report. True while couch mode is acting: the mouse then leaves the triggers to it.
@@ -726,7 +736,9 @@ impl Runner {
             self.stop();
             return false;
         }
-        let fresh = FRESH.swap(false, Ordering::Relaxed); // always taken, so it cannot linger
+        // Taken on every report while couch mode is on, so it cannot linger. While it is off the
+        // flag stays set until the next report with it on, which starts afresh anyway.
+        let fresh = FRESH.swap(false, Ordering::Relaxed);
         let was_live = std::mem::replace(&mut self.live, true);
         if fresh && was_live {
             let out = self.c.release(); // a drag in progress lets go before the fresh start
@@ -739,12 +751,11 @@ impl Runner {
         }
         // A dry run acts on nothing, so it asks nothing.
         let (quiet, exe) = if self.dry { (None, String::new()) } else { front() };
-        if let Some(q) = quiet {
-            let why = reason(q, &exe);
-            let mut f = IN_FRONT.lock().unwrap_or_else(|e| e.into_inner());
-            if *f != why {
-                *f = why;
-            }
+        if let Some(q) = quiet
+            && self.told.as_ref().is_none_or(|t| t.0 != q || t.1 != exe)
+        {
+            *IN_FRONT.lock().unwrap_or_else(|e| e.into_inner()) = reason(q, &exe);
+            self.told = Some((q, exe));
         }
         let out = self.c.step(s, dt, quiet.is_some());
         self.act(&out);
@@ -992,7 +1003,7 @@ mod tests {
     }
 
     /// Reads only: every visible top-level window on the running machine and what couch mode makes of it
-    /// (how TextInputHost was found, and how the rule was measured).
+    /// (how TextInputHost was found, and a way to check the rule).
     /// `cargo test windows_in_front -- --ignored --nocapture`
     #[test]
     #[ignore]
@@ -1006,7 +1017,8 @@ mod tests {
                 if IsWindowVisible(h) == 0 || r.right - r.left < 200 {
                     return 1;
                 }
-                let (pid, (exe, full)) = (look::owner(h), look::window(h));
+                let pid = look::owner(h);
+                let (exe, full) = look::window(h, pid);
                 let t = Instant::now();
                 let reads = look::reads(pid, browser(&exe));
                 println!("{pid:6} {:28} full {full:5} reads {reads:?} in {:?}: {:?}", file_name(&exe), t.elapsed(), quiet_for(full, &exe, reads));

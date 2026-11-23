@@ -4,6 +4,18 @@
 pub const VID: u16 = 0x054C;
 pub const PIDS: [u16; 2] = [0x0CE6, 0x0DF2]; // DualSense, DualSense Edge
 
+/// The first DualSense found: (whether it is on Bluetooth, the open device). None when none is there.
+pub fn open_first() -> Option<(bool, hidapi::HidDevice)> {
+    let api = hidapi::HidApi::new().ok()?;
+    let info = api.device_list().find(|d| d.vendor_id() == VID && PIDS.contains(&d.product_id()))?.clone();
+    Some((matches!(info.bus_type(), hidapi::BusType::Bluetooth), info.open_device(&api).ok()?))
+}
+
+/// Whether a Bluetooth feature report (all `f`, CRC last) ends in a good CRC, seeded with 0xA3.
+pub fn feature_crc_ok(f: &[u8]) -> bool {
+    f.len() >= 5 && crc32(0xA3, &f[..f.len() - 4]) == u32::from_le_bytes(f[f.len() - 4..].try_into().unwrap())
+}
+
 /// Standard CRC-32 over one seed byte followed by the report bytes.
 /// Seeds: 0xA1 input, 0xA2 output, 0xA3 feature (Bluetooth only).
 pub fn crc32(seed: u8, data: &[u8]) -> u32 {
@@ -35,12 +47,12 @@ pub struct State {
     pub buttons: [u8; 3],
     /// (level 0..=10, charging nibble). Not present in the short report.
     pub battery: Option<(u8, u8)>,
-    /// Trigger feedback, full reports only (community wiki; measured on USB and Bluetooth;
+    /// Trigger feedback, full reports only (community wiki; checked on USB and Bluetooth;
     /// the state nibble's meaning is not settled):
     /// [R2, L2, active]. R2/L2: low nibble = stop zone, high nibble = state.
     /// active: low nibble R2, high nibble L2; 0 off, 1 resistance, 2 click, 3 vibration.
     pub trig: Option<[u8; 3]>,
-    /// Motion, full reports only (layout from the Linux driver; seen live 2026-11-10):
+    /// Motion, full reports only (layout from the Linux driver):
     /// (gyro x y z = pitch yaw roll, accel x y z, sensor timestamp in 1/3 microsecond units).
     pub imu: Option<([i16; 3], [i16; 3], u32)>,
     /// The two touch points, full reports only: Some((finger id, x 0-1919, y 0-1079)) while touched.
@@ -65,7 +77,7 @@ pub fn parse(bt: bool, r: &[u8]) -> Option<(Kind, State)> {
             (Kind::BtFull { crc_ok }, &r[2..])
         }
         (true, 0x01, 10..) => {
-            // Short layout (Cross, PS, sticks, hat seen on the controller; triggers not yet):
+            // Short layout (sticks, hat and Cross/PS checked on the controller; the triggers at bytes 8 and 9 not yet):
             // lx ly rx ry, hat+face, shoulders, ps/touchpad+counter, l2, r2.
             let s = State {
                 sticks: [r[1], r[2], r[3], r[4]],
@@ -353,7 +365,7 @@ pub fn haptic_report(seq: u8, counter: u8, frames: &[[i8; 2]]) -> Vec<u8> {
     r[0] = 0x32;
     r[1] = (seq & 0x0F) << 4;
     // 0x11: 0xFE = mic session closed, 0xFF = open. Every audio report sets it, and a 0xFE closes an
-    // open mic (PadForge, measured), so it follows the one shared MIC flag.
+    // open mic (PadForge), so it follows the one shared MIC flag.
     let mic = if MIC.load(std::sync::atomic::Ordering::Relaxed) { 0xFF } else { 0xFE };
     r[2..11].copy_from_slice(&[0x91, 7, mic, 0, 0, 0, 0, 0xFF, counter]);
     r[11..13].copy_from_slice(&[0x92, 64]);
@@ -442,7 +454,7 @@ mod tests {
 
     #[test]
     fn bt_motion_and_touch() {
-        // A real report from a controller at rest over Bluetooth (2026-11-10).
+        // A real report from a controller at rest over Bluetooth.
         let hex = "31 11 81 7f 81 7f 00 00 01 08 00 00 00 31 13 4b 37 fd ff fe ff 0a 00 72 01 93 20 68 fe 51 88 9f 44 09 86 c8 23 03 80 00 00 00 58 09 09 00 00 00 00 00 4c 90 9f 44 06 00 00 83 22 f0 df 88 01 59 bb 00 00 00 00 00 00 00 00 00 4f a7 be da";
         let mut r: Vec<u8> = hex.split(' ').map(|b| u8::from_str_radix(b, 16).unwrap()).collect();
         let (k, s) = parse(true, &r).unwrap();
@@ -604,7 +616,8 @@ mod tests {
         assert_eq!(sp[212], 7);
         assert!(sp[213..330].iter().all(|&b| b == 0));
         assert_eq!(&sp[330..], &crc32(0xA2, &sp[..330]).to_le_bytes());
-        // The only test that touches MIC (others build audio reports in parallel and never check byte 4).
+        // The only test that sets MIC; it takes the shared test lock so it runs apart from the pacing test.
+        let _one = crate::ui::tests::HOLDS.lock().unwrap();
         MIC.store(true, std::sync::atomic::Ordering::Relaxed);
         let open = haptic_report(0, 0, &[]);
         MIC.store(false, std::sync::atomic::Ordering::Relaxed);

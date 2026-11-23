@@ -5,15 +5,19 @@
 #   else: each packet padded with zeros to [size] bytes (the clips use 200).
 # A packet longer than [size] stops the run: cutting it would corrupt the clip.
 import sys
+if len(sys.argv) not in (3, 4):
+    sys.exit('usage: python ogg2frames.py <in.ogg> <out.bin> [size]')
 data=open(sys.argv[1],'rb').read(); pos=0; packets=[]; cur=b''
 while pos < len(data):
-    assert data[pos:pos+4]==b'OggS'
+    if data[pos:pos+4]!=b'OggS':
+        sys.exit(f'{sys.argv[1]}: no Ogg page at byte {pos}; is this an Ogg Opus file?')
     nseg=data[pos+26]; lac=data[pos+27:pos+27+nseg]; body=pos+27+nseg
     for l in lac:
         cur+=data[body:body+l]; body+=l
         if l<255: packets.append(cur); cur=b''
     pos=body
-audio=packets[2:]  # skip OpusHead, OpusTags
+audio=[p for p in packets[2:] if p]  # skip OpusHead, OpusTags and empty packets
+if not audio: sys.exit(f'{sys.argv[1]}: no audio packets')
 sizes=sorted(set(len(p) for p in audio)); tocs=sorted(set(p[0] for p in audio))
 print(len(audio),'packets, sizes',sizes,'tocs',[hex(t) for t in tocs])
 want=int(sys.argv[3]) if len(sys.argv)>3 else None

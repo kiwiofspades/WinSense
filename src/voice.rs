@@ -128,8 +128,8 @@ pub fn mic_frame(r: &[u8]) -> Option<&[u8]> {
 }
 
 /// The mic switch alone, in PadForge's form (layout only): report 0x32 with sequence 0, packet
-/// 0x11 [mic, 0, 0, 0, 0, buffer 48, counter] and 64 silent haptic bytes. MEASURED with Steam
-/// closed: 101 mic frames a second.
+/// 0x11 [mic, 0, 0, 0, 0, buffer 48, counter] and 64 silent haptic bytes. With Steam closed this
+/// gives 101 mic frames a second.
 pub fn toggle(open: bool, counter: u8) -> Vec<u8> {
     ds::MIC.store(open, Ordering::Relaxed);
     let mut r = ds::haptic_report(0, counter, &[]);
@@ -187,8 +187,7 @@ const FLUSH: Duration = Duration::from_millis(300);
 
 /// Programs paused while the controller's mic is open: a frozen Steam reads
 /// no mic frames, so none become button presses. Dropping it lets them run again, after `FLUSH`.
-// shortcut: if WinSense is killed while listening (8 s at most), Steam stays frozen until it is ended in Task Manager; a helper process that resumes it would fix that.
-// shortcut: a game or emulator that reads the pad itself (SDL) is not paused and still sees stray presses while Mute is held.
+// Known limits: if WinSense is killed while listening (8 s at most), Steam stays frozen until it is ended in Task Manager (a helper process that resumes it would fix that). A game or emulator that reads the pad itself (SDL) is not paused and still sees stray presses while Mute is held.
 #[derive(Default)]
 struct Paused(Vec<(u32, windows::Win32::Foundation::HANDLE)>);
 impl Paused {
@@ -307,8 +306,8 @@ fn hear(pcm: &[u8], phrases: &[String]) -> windows::core::Result<Option<(String,
         }
         for n in phrases {
             // A phrase the engine cannot pronounce is left out.
-            // MEASURED: at full weight the six "move <app> to monitor <n>" per app halve every other
-            // phrase's share and David's bare "Couch mode." went unheard (1/3 too); at 1/6 Zira's
+            // At full weight the six "move <app> to monitor <n>" per app halve every other
+            // phrase's share and a bare "Couch mode." went unheard (1/3 too); at 1/6 a
             // "Move steam to monitor one." came out as "monitor one". 1/4 keeps both.
             let weight = if n.starts_with("move ") { 0.25 } else { 1.0 };
             let _ = g.AddWordTransition(mid, SPSTATEHANDLE::default(), &HSTRING::from(n.as_str()), w!(" "), SPWT_LEXICAL, weight, std::ptr::null());
@@ -358,11 +357,11 @@ fn hear(pcm: &[u8], phrases: &[String]) -> windows::core::Result<Option<(String,
     }
 }
 
-/// The phrase's confidence. MEASURED (David and Zira recordings): "couch" as the very first
+/// The phrase's confidence. With test recordings, "couch" as the very first
 /// word of what was said scores 0.09-0.47 although it was right, and 0.90-0.99 anywhere else
 /// ("Computer, couch mode on", "turn on couch mode"); "mode" and "on" score 0.97-0.99 either way.
 /// So with "couch" first, the words after it decide, and only when all of them are clear and
-/// "couch" itself is not near zero: "What a couch potato." fails on its "mode" (0.04), Zira's
+/// "couch" itself is not near zero: "What a couch potato." fails on its "mode" (0.04), and
 /// "Catch mode on." on its "couch" (0.002; a real one was never under 0.09).
 fn confidence(words: &[(String, f32)], whole: f32) -> f32 {
     match words {
@@ -599,7 +598,7 @@ fn areas(listing: &str) -> Vec<(String, String)> {
 }
 
 /// Run Retro Shelf's exe with fixed arguments, hidden. `wait`: its output, given 2 s (an older
-/// Retro Shelf does not know `--pages` and would stay open as the app: then nothing is read).
+/// Retro Shelf does not know `--pages` and would stay open as the app: it is killed, nothing is read).
 fn shelf(exe: &str, args: &[&str], wait: bool) -> Option<String> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -610,13 +609,24 @@ fn shelf(exe: &str, args: &[&str], wait: bool) -> Option<String> {
     if !wait {
         return None; // started; only the pages listing is read
     }
+    // Read on a helper thread so a large output cannot fill the pipe and block the child.
+    let mut out = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+        let _ = tx.send(buf);
+    });
+    // Its exit decides, not the end of the pipe: a child process it starts may keep the pipe open.
     for _ in 0..40 {
         if child.try_wait().ok()?.is_some() {
-            return child.wait_with_output().ok().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+            return Some(rx.recv_timeout(Duration::from_millis(500)).map(|b| String::from_utf8_lossy(&b).into_owned()).unwrap_or_default());
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    Some(String::new()) // still running after 2 s: no pages
+    let _ = child.kill(); // still running after 2 s: no pages
+    let _ = child.wait();
+    Some(String::new())
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -650,7 +660,7 @@ const NEXT: u16 = 0xB0; // VK_MEDIA_NEXT_TRACK
 const PREVIOUS: u16 = 0xB1; // VK_MEDIA_PREV_TRACK
 
 /// Commands that are the same on every PC.
-// shortcut: "pause" and "play" both press the play/pause key, so "pause" while paused starts it; asking the player for its state (Windows' media session API) would fix that.
+// "pause" and "play" both press the play/pause key, so "pause" while paused starts it; asking the player for its state (Windows' media session API) would fix that.
 // "turn on mouse" and "touchpad on" are there because "mouse on" scored only 0.72 in one of the two test voices (they scored 0.98).
 const FIXED: &[(&str, Said<'static>)] = &[
     ("volume up", Said::Volume(true)),
@@ -689,7 +699,7 @@ const SHOW: [&str; 3] = ["show monitor ", "monitor ", "show "];
 const NUMBERS: [&str; 6] = ["one", "two", "three", "four", "five", "six"];
 
 /// The volume of the default playback device, which is what the volume keys change.
-/// DECISION: this interface, not the volume keys: "mute" and "unmute" must be exact (the key only
+/// This interface is used, not the volume keys: "mute" and "unmute" must be exact (the key only
 /// flips), a step can be a tenth (a key press is 2 %), and injected keys do not reach Windows
 /// while an elevated program is in front. Cost: Windows' volume flyout does not show.
 fn endpoint() -> windows::core::Result<IAudioEndpointVolume> {
@@ -842,7 +852,7 @@ fn command(frames: &[u8]) -> Vec<u8> {
 /// The tray's voice thread: plays the sounds asked for through `SOUND`, and runs the hold-Mute
 /// command on the first Bluetooth DualSense. Only acts in the full report (Mute is not in the
 /// short one), so it never switches the controller itself. A dry tray has no voice.
-// shortcut: clips use their own report counter; a mod's haptic tone (0x32) at the same moment may stall the pad's audio for a second (PadForge). Share one counter if that is ever felt.
+// Clips use their own report counter; a mod's haptic tone (0x32) at the same moment may stall the pad's audio for a second (PadForge). Share one counter if that shows up.
 pub fn run(stop: &AtomicBool, dry: bool) {
     if dry {
         return;
@@ -915,7 +925,7 @@ pub fn run(stop: &AtomicBool, dry: bool) {
                     play(LISTEN); // before the mic opens, so it does not hear the ding
                     // Steam is frozen from here until the mic is closed again, so it reads no mic frame.
                     if paused.steam() {
-                        // shortcut: one open, no resend; a lost one ends in "Didn't quite catch that".
+                        // One open, no resend; a lost one ends in "Didn't quite catch that".
                         let _ = dev.write(&toggle(true, 1));
                         listening = Some((Instant::now(), Vec::new()));
                     } else {
@@ -983,7 +993,7 @@ pub fn capture(secs: u64, file: &str) -> Result<(), String> {
     if steam_running() {
         return Err("Steam is running: it reads the mic frames as button presses. Exit Steam first.".into());
     }
-    // shortcut: Ctrl-C here leaves the mic open (no handler in this test command); the tray's voice thread closes a stray mic, or turn the controller off and on.
+    // Ctrl-C here leaves the mic open (no handler in this test command); the tray's voice thread closes a stray mic, or turn the controller off and on.
     let close = Close(&dev);
     dev.write(&toggle(true, 1)).map_err(|e| format!("open failed: {e}"))?;
     let mut frames = Vec::new();
@@ -1120,7 +1130,7 @@ mod tests {
         assert!(!window_of("Downloads", r"C:\Windows\explorer.exe", "steam", "steam://rungameid/1"));
     }
 
-    /// The commands of 0.13.0 as data: nothing here presses a key, changes the volume or touches a controller.
+    /// The fixed commands as data: nothing here presses a key, changes the volume or touches a controller.
     #[test]
     fn fixed_commands_become_actions() {
         for (phrase, want) in [
@@ -1150,13 +1160,13 @@ mod tests {
         assert_eq!(said("close notepad"), Some(Said::Close("notepad")), "close with a name is still the app");
         // Measured word confidences: "couch" first is under-scored, the rest decides.
         let w = |v: &[(&str, f32)]| v.iter().map(|(t, c)| (t.to_string(), *c)).collect::<Vec<_>>();
-        assert!(confidence(&w(&[("couch", 0.09), ("mode", 0.99), ("on", 0.99)]), 0.68) >= CONFIDENCE, "Zira, \"Couch mode on.\"");
-        assert!(confidence(&w(&[("couch", 0.45), ("mode", 0.98)]), 0.76) >= CONFIDENCE, "David, \"Couch mode.\"");
+        assert!(confidence(&w(&[("couch", 0.09), ("mode", 0.99), ("on", 0.99)]), 0.68) >= CONFIDENCE, "female voice, \"Couch mode on.\"");
+        assert!(confidence(&w(&[("couch", 0.45), ("mode", 0.98)]), 0.76) >= CONFIDENCE, "male voice, \"Couch mode.\"");
         assert!(confidence(&w(&[("couch", 0.97), ("mode", 0.04)]), 0.64) < CONFIDENCE, "\"What a couch potato.\"");
         assert!(confidence(&w(&[("couch", 0.30), ("mode", 0.85), ("on", 0.99)]), 0.7) < CONFIDENCE, "a word after it unclear: refused");
         assert_eq!(confidence(&w(&[("computer", 0.0), ("couch", 0.99), ("mode", 0.97)]), 0.62), 0.62, "only when couch comes first");
         assert_eq!(confidence(&w(&[("couch", 0.2)]), 0.2), 0.2);
-        assert!(confidence(&w(&[("couch", 0.002), ("mode", 0.99), ("on", 0.99)]), 0.65) < CONFIDENCE, "Zira, \"Catch mode on.\"");
+        assert!(confidence(&w(&[("couch", 0.002), ("mode", 0.99), ("on", 0.99)]), 0.65) < CONFIDENCE, "female voice, \"Catch mode on.\"");
         assert_eq!(said("open play"), Some(Said::Open("play")), "an app's name is still an app");
         assert!(FIXED.iter().enumerate().all(|(i, f)| FIXED[..i].iter().all(|g| g.0 != f.0)), "no phrase twice");
         assert_eq!((step(0.5, true), step(0.95, true), step(0.05, false)), (0.6, 1.0, 0.0));
@@ -1275,10 +1285,10 @@ mod tests {
         let all = phrases(&names, &[]);
         let taken = |frames: &[u8]| hear(&decode(frames).unwrap(), &all).unwrap().filter(|h| h.1 >= CONFIDENCE).map(|h| h.0);
         let heard: [(&[u8], Said); 14] = [
-            (include_bytes!("../assets/test_move_notepad.frames"), Said::Move("notepad", 3)), // David: "Move notepad to monitor three."
-            (include_bytes!("../assets/test_show_two.frames"), Said::Show(2)), // David, no name: "Show two."
-            (include_bytes!("../assets/test_show_monitor_three.frames"), Said::Show(3)), // Zira: "Show monitor three."
-            (include_bytes!("../assets/test_monitor_two.frames"), Said::Show(2)), // David: "Monitor two." (0.89)
+            (include_bytes!("../assets/test_move_notepad.frames"), Said::Move("notepad", 3)), // Male voice: "Move notepad to monitor three."
+            (include_bytes!("../assets/test_show_two.frames"), Said::Show(2)), // Male voice, no name: "Show two."
+            (include_bytes!("../assets/test_show_monitor_three.frames"), Said::Show(3)), // Female voice: "Show monitor three."
+            (include_bytes!("../assets/test_monitor_two.frames"), Said::Show(2)), // Male voice: "Monitor two." (0.89)
             (include_bytes!("../assets/test_volume_up.frames"), Said::Volume(true)), // "Computer, volume up."
             (include_bytes!("../assets/test_mute.frames"), Said::Mute(true)),
             (include_bytes!("../assets/test_next.frames"), Said::Key(NEXT)),
@@ -1287,14 +1297,14 @@ mod tests {
             (include_bytes!("../assets/test_controller_off.frames"), Said::Power),
             (include_bytes!("../assets/test_turn_on_mouse.frames"), Said::Touch(true)),
             (include_bytes!("../assets/test_couch_on.frames"), Said::Couch(Some(true))), // "Computer, couch mode on."
-            (include_bytes!("../assets/test_couch_on_plain.frames"), Said::Couch(Some(true))), // Zira, no name: "Couch mode on." (0.68 before)
-            (include_bytes!("../assets/test_couch_plain.frames"), Said::Couch(None)), // David: "Couch mode."
+            (include_bytes!("../assets/test_couch_on_plain.frames"), Said::Couch(Some(true))), // Female voice, no name: "Couch mode on."
+            (include_bytes!("../assets/test_couch_plain.frames"), Said::Couch(None)), // Male voice: "Couch mode."
         ];
         for (frames, want) in heard {
             assert_eq!(taken(frames).as_deref().and_then(said), Some(want));
         }
-        // A single near-rhyme said alone may be taken (documented: "moot" 0.88). "Cute." was 0.74
-        // until the gyro phrases left the grammar, now about 0.82: at worst it mutes.
+        // A single near-rhyme said alone may be taken (documented: "moot" 0.88). "Cute." scores about 0.82:
+        // at worst it mutes.
         assert!(matches!(taken(include_bytes!("../assets/test_cute.frames")).as_deref().and_then(said), None | Some(Said::Mute(true))), "Cute.");
         let refused: [(&[u8], &str); 9] = [
             (include_bytes!("../assets/test_move_over.frames"), "Move notepad over there."),

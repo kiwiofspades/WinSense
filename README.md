@@ -21,16 +21,17 @@ It is one exe of about 1.5 MB. It needs no installer, no .NET, and no Visual C++
 - **Voice commands**: hold Mute and say "open Notepad", "volume up", "battery" and so on. This runs
   offline with Windows' own speech engine.
 - **Battery**: charge in the tray menu, a warning when it is low, and an optional switch-off when
-  idle.
-- **Game sound as haptics**: the bass of whatever the PC plays, felt in the grips.
+  idle. Over Bluetooth the charge shows only once the controller is on the long report (see below),
+  for example after a long press on the touchpad.
+- **Game sound as haptics**: the low end (20 to 800 Hz) of whatever the PC plays, felt in the grips.
 - **Mute light follows the PC mic**, and **buzz on notifications**.
 - **Mod port**: a named pipe that takes one text line per game event, so a mod in any language can
   set triggers, rumble, haptics, lights and sounds. See [docs/modding.md](docs/modding.md).
 
 On from the start: the touchpad mouse, voice commands on hold-Mute, the mod port, the low-battery
 balloon and the daily update check. Off until you tick them in the tray menu: couch mode, game
-sound as haptics, the mute light, the notification buzz, hands off, turn off when idle and start
-with Windows.
+sound as haptics, the mute light, the notification buzz, "Hands off the controller while a game is
+in front", turn off when idle and start with Windows.
 
 ## Install
 
@@ -53,8 +54,8 @@ you can check that your download matches.
 3. Open **Trigger test screen** from the tray menu, pick an effect and squeeze the trigger.
    Closing that window switches every effect off again.
 4. Slide a finger on the touchpad to move the cursor. On the cable this works at once. Over
-   Bluetooth, first hold a finger still on the touchpad for about half a second; a chime confirms.
-   The same long press later switches the touchpad mouse off and on.
+   Bluetooth, first press the touchpad down and keep it down, finger still, for about 0.6 seconds;
+   a chime confirms. The same long press later switches the touchpad mouse off and on.
 
 The [user guide](docs/guide.md) explains every menu item, button and voice command.
 
@@ -76,10 +77,11 @@ WinSense waits to switch until you use one of those features.
 
 ## Updates
 
-WinSense checks GitHub for a new release when it starts and at most once a day after that. When
-one is out, a balloon tells you. Nothing is downloaded until you say yes. The download is checked
-against the SHA-256 published with the release, then WinSense swaps in the new exe and restarts.
-You can also use **Check for updates** in the tray menu.
+WinSense asks GitHub for the latest release's details when it starts, if the last check was more
+than a day ago, and again about once a day while it runs. A check that fails is tried again after
+15 minutes. When a newer release is out, a balloon tells you. Nothing is downloaded until you say
+yes. The download is checked against the SHA-256 published with the release, then WinSense swaps in
+the new exe and restarts. You can also use **Check for updates** in the tray menu.
 
 ## Build from source
 

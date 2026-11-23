@@ -1,4 +1,4 @@
-//! The PC's state on the controller (0.15.0), tray only, each OFF unless ticked:
+//! The PC's state on the controller, tray only, each OFF unless ticked:
 //! "Mute light follows PC mic": the mute light is lit while the Windows default recording device
 //! is muted. "Buzz on notifications": a short double tap in the grips when Windows gets a new
 //! notification. One thread (`run`) looks a few times a second and only reads Windows; the light
@@ -44,8 +44,8 @@ impl Light {
 }
 
 /// A mic's own mute button (a USB mic's, for one) does not tell Windows: the endpoint stays unmuted, but
-/// the mic then sends exact digital silence. MEASURED 2026-11-11: button pressed = peak exactly 0
-/// for the whole 18 s; unmuted, silent room, Voice Clarity on = never 0 in about an hour (lowest
+/// the mic then sends exact digital silence. With the button pressed the peak stays exactly 0;
+/// unmuted in a silent room with Voice Clarity on it was never 0 in about an hour (lowest
 /// 0.0009). So: muted once the level has been exactly 0 for `HUSH`. `peak` is None when no app
 /// records from the mic (the level is 0 then, muted or not), which counts as not muted.
 #[derive(Default)]
@@ -86,7 +86,7 @@ impl Buzz {
 
 /// The Windows default recording device: its Windows mute, and its level (peak, 0-1) while an app
 /// records from it (None when none does). None when there is no recording device.
-/// DECISION: WinSense never records itself (the taskbar's "mic in use" icon would stay on), so a
+/// WinSense never records itself (the taskbar's "mic in use" icon would stay on), so a
 /// mute button is seen only while another app (Steam, Discord, a game) has the mic open.
 fn mic() -> Option<(bool, Option<f32>)> {
     use windows::Win32::Media::Audio::Endpoints::{IAudioEndpointVolume, IAudioMeterInformation};
@@ -103,7 +103,7 @@ fn mic() -> Option<(bool, Option<f32>)> {
 }
 
 /// The ids of the notifications Windows holds; None when Windows does not let us see them.
-/// DECISION: listed about once a second, not the NotificationChanged event (reported to fail
+/// Listed about once a second, not through the NotificationChanged event (reported to fail
 /// without package identity, and it could not be tried without raising a notification).
 fn listed(l: &UserNotificationListener) -> Option<Vec<u32>> {
     if l.GetAccessStatus().ok()? != UserNotificationListenerAccessStatus::Allowed {

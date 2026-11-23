@@ -64,9 +64,9 @@ After `hello`, WinSense writes lines back to your connection only, each ending i
   writes. From one thread, check for waiting data first (`PeekNamedPipe`), then read.
 - A second connection opened at the same moment as another can fail with "pipe busy": wait a
   little (`WaitNamedPipe`) and try again.
-- From pipe write to the report being ready to send took a median of 0.14 ms (95 % under 0.5 ms)
-  in a test run with no controller (2026-11-22). Writing it to the controller comes on top; not
-  measured yet.
+- In a test with no controller, the time from the pipe write to the report being ready to send had
+  a median of 0.14 ms (95 % under 0.5 ms). Writing it to the controller comes on top and has not
+  been measured.
 
 ## Line parts
 
@@ -88,8 +88,8 @@ Positions are zones from 0 (released) to 9 (fully pulled).
 - `resist`: steady resistance from the start zone on. A high strength from a middle zone makes a
   wall you can still push past.
 - `click`: resistance from start to end that gives way at the end, like a gun trigger.
-- `curve` (0.18.0 and later): resistance from the start zone with its own strength in each zone, one number per
-  zone from the start on; the last one carries on to zone 9. `r2 curve 1 2 2 3 4 5 6 7 8` grows
+- `curve`: resistance from the start zone with its own strength in each zone, one number per zone
+  from the start on; the last one carries on to zone 9. `r2 curve 1 2 2 3 4 5 6 7 8` grows
   stiffer through the pull; `r2 curve 3 1 1 5` is light, then firm from zone 5. `curve <start> <s>`
   is the same as `resist <start> <s>`. At most one number per zone from the start (10 - start).
 - `vibrate`: the trigger buzzes while it is pulled past the start zone. Use 20 Hz or more, and
@@ -118,9 +118,10 @@ ignored. A newer tone cuts the one that is playing. While a tone plays, the rumb
 (the tone cannot be felt over rumble) and come back after it. Triggers are not touched.
 
 Over Bluetooth this works directly; on the cable alone it plays through the controller's sound
-device. 80 Hz at 50 is a good start. Over Bluetooth the controller loses the first 150-200 ms of
-every new haptic stream, so WinSense puts 150 ms of silence in front of each tone: a tone is felt
-about 150 ms after its line (with a client stream open, at once, see below).
+device. 80 Hz at 50 is a good start. In tests over Bluetooth, the first 150 to 200 ms of every new
+haptic stream was not felt, so short tones were not felt at all. WinSense therefore puts 150 ms of
+silence in front of each tone: a tone is felt about 150 ms after its line (with a client stream
+open, at once, see below).
 
 #### Your own samples: `haptic stream`
 
@@ -175,10 +176,11 @@ sound <name>
 ```
 
 Plays one built-in sound on the controller's speaker: `ding`, `ding2`, `off`, `listen`,
-`pickup`, `alert`, `radio`, `levelup`. Over Bluetooth only. One plays at a time: a sound that
-is playing finishes first, and of the requests that came meanwhile only the newest plays after it. Sounds are dropped (not
-played later) while the player is speaking a voice command. A line with only a sound changes
-nothing else. A mod cannot send its own audio.
+`pickup`, `alert`, `radio`, `levelup`. Over Bluetooth only. One plays at a time: a sound that is
+playing finishes first, and of the requests that came meanwhile only the newest plays after it.
+Sounds are dropped (not played later) while the controller's mic is open for a voice command, and
+while a game holds the controller (`release`). A line with only a sound changes nothing else. A mod
+cannot send its own audio.
 
 ### Handing the controller to a game
 
@@ -240,7 +242,9 @@ tray's trigger test screen.
 
 - Per trigger, the first that is not `off` wins: the `for` line, then the lasting state, then the
   test screen. An `off` is see-through in every layer: a mod's `off` cannot switch off an effect
-  the test screen set, and an `off` in a `for` line changes nothing.
+  the test screen set, and an `off` in a `for` line changes nothing. A lasting `r2 off` takes away
+  the mod's own earlier effect on that trigger, and the test screen's effect, if it set one, then
+  shows through again.
 - Each rumble motor takes the strongest value of all of them (and of a game's rumble through the
   optional virtual pad).
 - Lights: the `for` line, else the lasting light.
@@ -299,19 +303,19 @@ Whether this works inside Unity's Mono runtime has not been checked.
 #include <windows.h>
 #include <cstring>
 
-static void send(HANDLE pipe, const char* line) {
+static void put(HANDLE pipe, const char* line) {
     DWORD written;
     WriteFile(pipe, line, (DWORD)strlen(line), &written, nullptr);
 }
 
 int main() {
     HANDLE pipe = CreateFileW(L"\\\\.\\pipe\\WinSense", GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (pipe == INVALID_HANDLE_VALUE) return 1;  // WinSense is not running
-    send(pipe, "beam\n");
+    if (pipe == INVALID_HANDLE_VALUE) return 1;  // not running, or ERROR_PIPE_BUSY (WaitNamedPipe, retry)
+    put(pipe, "beam\n");
     Sleep(4000);
-    send(pipe, "hit\n");
+    put(pipe, "hit\n");
     Sleep(500);
-    send(pipe, "stop\n");
+    put(pipe, "stop\n");
     CloseHandle(pipe);
 }
 ```
@@ -334,8 +338,9 @@ end
 
 ## Tips
 
-- Open the pipe once when the game starts and keep it open. If opening fails, WinSense is not
-  running: carry on without it, and try again later if you like.
+- Open the pipe once when the game starts and keep it open. If opening fails, WinSense may not be
+  running, or the pipe was busy (wait a moment and try again): carry on without it, and try again
+  later if you like.
 - Send a line when something changes, not every frame.
 - Test lines with Python before putting them in your mod, or say `hello` and read the `err`
   lines: without `hello` a wrong line is silently ignored.
@@ -353,4 +358,4 @@ python assets/ogg2frames.py out.opus out.bin
 ```
 
 Every packet must be 200 bytes (the script prints them). `assets/clips.py` makes the synthesised
-bells. Then add the clip to `src/voice.rs`.
+sounds (`pickup`, `radio`, `levelup`). Then add the clip to `src/voice.rs`.

@@ -1,10 +1,10 @@
-//! Game sound as haptics (0.12.0): while the tray's toggle is on, what Windows plays on the
+//! Game sound as haptics: while the tray's toggle is on, what Windows plays on the
 //! default playback device is captured (WASAPI loopback: reads only, makes no sound), its low end
 //! is kept and sent to the grips of every Bluetooth DualSense in report 0x32, so any game gets
 //! haptics without a mod. The haptic thread (src/port.rs) owns the `Stream` and plays it between
 //! a mod's tones. Rules: docs/guide.md.
 //!
-//! Filter (0.17.1): per channel a 20 Hz high-pass (4th order: DC and sub-bass the actuators
+//! Filter: per channel a 20 Hz high-pass (4th order: DC and sub-bass the actuators
 //! cannot move) and an 800 Hz low-pass (8th-order Butterworth), run at the capture rate. That
 //! low-pass is also the anti-alias filter for the 3 kHz output, so the downsample picks samples.
 //! Then a strength curve on the band's envelope (see LOW_DB), so loud and quiet parts of a song
@@ -24,12 +24,12 @@ pub static ON: AtomicBool = AtomicBool::new(false);
 pub static ACTIVE: AtomicBool = AtomicBool::new(false);
 
 const OUT: u32 = 3000; // report 0x32's sample rate
-/// The band (0.17.1): 20 Hz to 800 Hz, bass and the tune. Felt as better than 20-200 Hz;
-/// a vocals band (150-900 Hz, middle of the mix) gave "absolutely nothing".
+/// The band: 20 Hz to 800 Hz, bass and the tune. It feels better than 20-200 Hz;
+/// a vocals band (150-900 Hz, middle of the mix) gave nothing to feel.
 const LOW: f64 = 20.0;
 const HIGH: f64 = 800.0;
-/// Strength curve (0.17.1, measured on real music: low band 0.003 to 0.17 of full scale,
-/// average 0.04; loopback is taken before the Windows volume, so this holds at any volume). The
+/// Strength curve (on real music the low band ranges from 0.003 to 0.17 of full scale and
+/// averages 0.04; loopback is taken before the Windows volume, so this holds at any volume). The
 /// low band's envelope is mapped in dB: LOW_DB and below = OUT_MIN, HIGH_DB and above = full
 /// scale, straight in dB between. A tone at 10 % is felt, but 10 % and 35 % feel alike, so
 /// quiet and loud have to be far apart.
@@ -44,7 +44,7 @@ const RELEASE: f64 = 1.0 / (0.080 * OUT as f64);
 /// The gate: any sound at all (raw, before the filter) at or above -60 dB keeps the stream on...
 const GATE: f32 = 0.001;
 /// ...for 5 s after the last of it, so a song never restarts the stream (each new 0x32 stream
-/// loses its first part, measured with the notification buzz).
+/// loses its first part, as seen with the notification buzz).
 const HOLD: u32 = 5 * OUT;
 /// Frames kept waiting (32 ms): the lead-in when the gate opens, and the cushion between the
 /// sound card's clock and the PC's; older ones are dropped.
@@ -286,7 +286,7 @@ impl Stream {
             Ok(_) => {}
             Err(_) => self.cap = None, // the device went away: looked for again within 2 s
         }
-        // Rule: rumble wins. Report 0x32 is not felt while emulated rumble is on (measured), so
+        // Rule: rumble wins. Report 0x32 is not felt while emulated rumble is on, so
         // while the worker drives a motor (test screen, mod, game through the opt-in pad) the
         // stream waits; and it waits while the mic listens (a buzz in the grips is noise in it).
         let (open, rumble, mic) = (self.feed.open(), crate::ui::SENT_MOTORS.load(Ordering::Relaxed) != 0, crate::ds::MIC.load(Ordering::Relaxed));

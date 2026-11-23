@@ -6,7 +6,7 @@
 //! It starts the mouse thread (src/mouse.rs, reads only; it also runs couch mode), the voice
 //! thread (src/voice.rs), the desk thread and the mod port (src/port.rs). When a controller
 //! connected by Bluetooth is plugged in by cable too, it drops the Bluetooth link, so the
-//! controller runs on the cable alone (cable haptics are not felt while Bluetooth is up; measured).
+//! controller runs on the cable alone (cable haptics are not felt while Bluetooth is up).
 //! Quitting closes the screen and ends the worker, which switches triggers and rumble off if
 //! anything was ever sent. One tray per user session (a named mutex); while it runs, the CLI
 //! commands that write or move the mouse refuse (`claim`).
@@ -79,10 +79,6 @@ static DRY: AtomicBool = AtomicBool::new(false);
 /// The tray icon; a static, not thread-local: balloons also come from the cable-handover and
 /// update threads, and a null icon there blanked the tray icon.
 static ICON: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(null_mut());
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
-}
 
 /// Take the one-per-session WinSense lock; None when the tray (or another owner) already has it.
 /// Keep the handle for as long as the process should own the controller.
@@ -292,8 +288,8 @@ fn offer(h: HWND, r: crate::update::Release) {
     let yes = match answer.as_deref() {
         Some(a) => a == "yes",
         None => {
-            let main = wide(&format!("WinSense {} is available", r.version));
-            let body = wide(&format!(
+            let main = ui::wide(&format!("WinSense {} is available", r.version));
+            let body = ui::wide(&format!(
                 "You have {}. Download and install it now? WinSense restarts by itself, and any trigger effect or rumble stops for a moment.
 
 Release notes: github.com/{}/releases",
@@ -342,7 +338,7 @@ fn set_autostart(on: bool) -> u32 {
             return RegDeleteKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("WinSense"));
         }
         let Ok(exe) = std::env::current_exe() else { return ERROR_FILE_NOT_FOUND };
-        let v = wide(&format!("\"{}\"", exe.display()));
+        let v = ui::wide(&format!("\"{}\"", exe.display()));
         RegSetKeyValueW(HKEY_CURRENT_USER, RUN_KEY, w!("WinSense"), REG_SZ, v.as_ptr() as _, (v.len() * 2) as u32)
     }
 }
@@ -360,7 +356,6 @@ fn dword(name: PCWSTR) -> u32 {
     unsafe { RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name, RRF_RT_REG_DWORD, null_mut(), &mut v as *mut u32 as _, &mut size) };
     v
 }
-
 
 /// The Bluetooth addresses of the connected DualSenses: (by Bluetooth, by cable). Bluetooth: the
 /// HID serial (e.g. 0123456789ab). Cable: the serial is empty, so feature report 0x09.
@@ -440,7 +435,7 @@ fn wired_handover() -> Option<String> {
 fn show_menu(h: HWND) {
     unsafe {
         let m = CreatePopupMenu();
-        let item = |flags: u32, id: usize, text: &str| AppendMenuW(m, flags, id, wide(text).as_ptr());
+        let item = |flags: u32, id: usize, text: &str| AppendMenuW(m, flags, id, ui::wide(text).as_ptr());
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
         let state = mouse::STATE.load(Ordering::Relaxed);
         item(MF_STRING | MF_GRAYED, 0, status(state, mouse::TOUCH_ON.load(Ordering::Relaxed)));

@@ -7,7 +7,11 @@ the controller on Bluetooth).
 import sys, time
 
 pipe = sys.argv[1] if len(sys.argv) > 1 else r"\\.\pipe\WinSense"
-with open(pipe, "w", buffering=1) as winsense:  # one line per game event; line-buffered sends each at once
+try:
+    winsense = open(pipe, "w", buffering=1)  # line-buffered: each line goes at once
+except OSError as e:
+    sys.exit(f"Could not open {pipe}: {e.strerror}. The WinSense tray must be running.")
+with winsense:
     winsense.write("light 0 80 255 players 4\n")  # lasting: a blue bar and the centre player light
     time.sleep(2)
     winsense.write("flash 255 0 0\n")             # hit: red for a moment, then the blue comes back

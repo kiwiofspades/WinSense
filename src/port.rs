@@ -1,4 +1,4 @@
-//! The mod port (0.8.0): a game mod writes one short text line per game event into the
+//! The mod port: a game mod writes one short text line per game event into the
 //! named pipe `\\.\pipe\WinSense`, and the tray's worker plays it (src/ui.rs; the tray stays the
 //! only writer). Any language that can open a file can use it, Lua's `io.open` included, so a mod
 //! needs no DLL and nothing is registered. WinSense writes back only to a client that said `hello`
@@ -280,7 +280,7 @@ fn client(rx: &Receiver<Option<Haptic>>, first: Option<Option<Haptic>>, bt: &mut
 /// cuts the running one between reports. Bluetooth first (also when the cable is in too: the cable
 /// is not felt then); with the cable alone, sound on its rear channels.
 ///
-/// Since 0.12.0 it also plays game sound as haptics (src/sound.rs) while that toggle is on: between
+/// It also plays game sound as haptics (src/sound.rs) while that toggle is on: between
 /// tones it takes in what Windows plays every 10 ms and streams the low end while there is any. A
 /// mod's tone comes first: it cuts the stream between reports, and the stream picks up after it.
 /// A client stream (`haptic stream`) comes before both: tones are mixed into it.
@@ -575,9 +575,11 @@ fn serve(id: u32, mut r: impl BufRead, out: &impl Fn(Out), talk: &impl Fn(Option
             holds = on;
             out(Out::Hold(id, on));
         }
-        if l.stop || l.haptic.is_some() && !crate::ui::RELEASED.load(std::sync::atomic::Ordering::Relaxed) {
-            let tone = l.haptic.zip(l.ms).map(|((side, hz, level), ms)| (side, hz, level, ms as u32));
-            // shortcut: the motors rest for the lead-in too, also where none is played (a warm client stream, the cable): 150 ms more rest.
+        let released = crate::ui::RELEASED.load(std::sync::atomic::Ordering::Relaxed);
+        if l.stop || l.haptic.is_some() && !released {
+            // While released a tone is dropped, but `stop` still silences.
+            let tone = l.haptic.zip(l.ms).filter(|_| !released).map(|((side, hz, level), ms)| (side, hz, level, ms as u32));
+            // The motors rest for the lead-in too, even where none is played (a warm client stream, the cable): 150 ms more rest.
             let ms = tone.map_or(0, |t| (t.3 + crate::audio::LEAD) as u64);
             timed(&mut ends, 2, ms, &|| {
                 out(Out::Haptic(tone));
@@ -822,8 +824,7 @@ pub fn start(tx: Sender<Msg>, dry: bool) {
 
 /// "Buzz on notifications" (src/desk.rs): a double tap in the grips, like a phone, played as one
 /// stream (`audio::tap_bt`, why: there). The motors rest meanwhile. Length 0 marks it: no mod line
-/// can carry 0 ms.
-/// shortcut: it cuts a mod's tone that happens to play; game sound as haptics picks up after it.
+/// can carry 0 ms. It cuts a mod's tone that happens to play; game sound as haptics picks up after it.
 const TAP: Haptic = (crate::audio::Side::Both, 80, 100, 0);
 /// Wakes the haptic thread for a client stream and cuts nothing: no line can carry 0 Hz.
 const WAKE: Haptic = (crate::audio::Side::Both, 0, 0, 0);
@@ -839,7 +840,7 @@ pub fn tap() {
 }
 
 /// Wake the haptic thread so it sees the "Game sound as haptics" toggle.
-/// shortcut: sent as "silence", so it also cuts a mod's tone that happens to play at that click.
+/// It is sent as "silence", so it also cuts a mod's tone that happens to play at that click.
 pub fn poke() {
     send(Out::Haptic(None));
 }

@@ -7,8 +7,8 @@
 //! the window switches both triggers and the rumble off. `--dry` opens no controller and prints the reports.
 //! With `--pad` (opt-in: by default the DualSense stays itself) it also runs the virtual Xbox 360 pad (src/pad.rs); a game's rumble
 //! reaches the same worker, so it never wipes the trigger effects (every report carries both).
-//! Since 0.6.0 it also runs the touchpad mouse (src/mouse.rs, reads only) unless `--dry`.
-//! Since 0.7.0 the tray program (src/tray.rs) opens the same window in its own process: there the
+//! It also runs the touchpad mouse (src/mouse.rs, reads only) unless `--dry`.
+//! The tray program (src/tray.rs) opens the same window in its own process: there the
 //! worker lives as long as the tray, closing the window switches triggers and rumble off, and the
 //! tray runs the mouse.
 
@@ -20,7 +20,7 @@ use std::sync::{Mutex, mpsc};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::*;
-use windows_sys::Win32::Graphics::GdiPlus::{FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawPath, GdipFillEllipse, GdipFillPath, GdipFillRectangle, GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpGraphics, PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitWorld};
+use windows_sys::Win32::Graphics::GdiPlus::{FillModeAlternate, GdipAddPathArc, GdipClosePathFigure, GdipCreateFromHDC, GdipCreatePath, GdipCreatePen1, GdipCreateSolidFill, GdipDeleteBrush, GdipDeleteGraphics, GdipDeletePath, GdipDeletePen, GdipDrawPath, GdipFillEllipse, GdipFillPath, GdipFillRectangle, GdipSetPixelOffsetMode, GdipSetSmoothingMode, GdiplusStartup, GdiplusStartupInput, GpGraphics, GpPath, PixelOffsetModeHalf, SmoothingModeAntiAlias, UnitWorld};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::UI::HiDpi::GetDpiForSystem;
@@ -189,7 +189,7 @@ pub fn rumble_for(dev: &hidapi::HidDevice) -> ds::Rumble {
 }
 /// The mute light the worker's next report carries (0 off, 1 on), `NO_LIGHT` = none: a report
 /// without it leaves the light as it is, so it is sent once per change.
-/// shortcut: taken by the next write even when no controller is there to get it; src/desk.rs only asks while one is connected.
+/// The next write takes it even when no controller is there to get it; src/desk.rs only asks while one is connected.
 static LIGHT: AtomicU8 = AtomicU8::new(NO_LIGHT);
 const NO_LIGHT: u8 = 0xFF;
 /// A mod's lights for the worker's next report (`DARK` = give every light back), None = none:
@@ -204,6 +204,17 @@ pub static LINKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 pub static PADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// The worker's last result, shown in the status line.
 static STATUS: Mutex<String> = Mutex::new(String::new());
+/// The status while a game has the controller: a hand-off, not an error.
+const HELD: &str = "A game has the controller: nothing is sent";
+
+/// The status dot: Some(true) green (sent), Some(false) red (an error), None neutral (nothing yet, or held by a game).
+fn status_ok(status: &str) -> Option<bool> {
+    if status.is_empty() || status == HELD {
+        None
+    } else {
+        Some(status.starts_with("Sent") || status.starts_with("Dry"))
+    }
+}
 const WM_STATUS: u32 = WM_APP + 2;
 
 /// Layout units (pixels at 100 %) to pixels at the system DPI (the process is system DPI aware).
@@ -331,6 +342,7 @@ fn ctl_rect(c: Ctl) -> R {
 // ---- colours ----
 
 /// ARGB colours of one theme.
+#[derive(Clone, Copy)]
 pub(crate) struct Theme {
     pub(crate) dark: bool,
     pub(crate) bg: u32,
@@ -374,6 +386,22 @@ pub(crate) fn theme() -> Theme {
     }
 }
 
+thread_local! {
+    /// The window thread's theme, read from the registry when the window opens and on a settings change.
+    static THEME: std::cell::Cell<Option<Theme>> = const { std::cell::Cell::new(None) };
+}
+
+/// Read the theme again and keep it for `theme_cached`.
+fn theme_refresh() -> Theme {
+    let th = theme();
+    THEME.set(Some(th));
+    th
+}
+
+fn theme_cached() -> Theme {
+    THEME.get().unwrap_or_else(theme_refresh)
+}
+
 /// ARGB to GDI's 0x00BBGGRR.
 pub(crate) fn cref(c: u32) -> u32 {
     (c & 0xFF) << 16 | (c & 0xFF00) | (c >> 16 & 0xFF)
@@ -393,6 +421,20 @@ fn title_bar(h: HWND, th: &Theme) {
 pub(crate) struct Pen {
     g: *mut GpGraphics,
     s: f32,
+}
+
+/// A closed rounded-rectangle GDI+ path (device pixels, `d` = corner diameter); the caller deletes it.
+unsafe fn rounded_path(x: f32, y: f32, w: f32, h: f32, d: f32) -> *mut GpPath {
+    unsafe {
+        let mut path = null_mut();
+        GdipCreatePath(FillModeAlternate, &mut path);
+        GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
+        GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
+        GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
+        GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
+        GdipClosePathFigure(path);
+        path
+    }
 }
 
 impl Pen {
@@ -420,13 +462,7 @@ impl Pen {
             return;
         }
         unsafe {
-            let mut path = null_mut();
-            GdipCreatePath(FillModeAlternate, &mut path);
-            GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-            GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
-            GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
-            GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
-            GdipClosePathFigure(path);
+            let path = rounded_path(x, y, w, h, d);
             let mut brush = null_mut();
             GdipCreateSolidFill(fill, &mut brush);
             GdipFillPath(self.g, brush as _, path);
@@ -445,13 +481,7 @@ impl Pen {
         let s = self.s;
         let (x, y, w, h, d) = (r.0 * s, r.1 * s, r.2 * s, r.3 * s, 2.0 * radius * s);
         unsafe {
-            let mut path = null_mut();
-            GdipCreatePath(FillModeAlternate, &mut path);
-            GdipAddPathArc(path, x, y, d, d, 180.0, 90.0);
-            GdipAddPathArc(path, x + w - d, y, d, d, 270.0, 90.0);
-            GdipAddPathArc(path, x + w - d, y + h - d, d, d, 0.0, 90.0);
-            GdipAddPathArc(path, x, y + h - d, d, d, 90.0, 90.0);
-            GdipClosePathFigure(path);
+            let path = rounded_path(x, y, w, h, d);
             let mut pen = null_mut();
             GdipCreatePen1(color, width * s, UnitWorld, &mut pen);
             GdipDrawPath(self.g, pen, path);
@@ -493,7 +523,7 @@ pub(crate) fn text_with(dc: HDC, font: HFONT, s: &str, (x, y, w, h): R, color: u
 }
 
 fn paint(h: HWND) {
-    let th = theme();
+    let th = theme_cached();
     let status = STATUS.lock().unwrap().clone();
     MODEL.with_borrow(|m| unsafe {
         let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -538,7 +568,11 @@ fn paint(h: HWND) {
                 let r = ctl_rect(c);
                 p.ring((r.0 - 3.0, r.1 - 3.0, r.2 + 6.0, r.3 + 6.0), 7.0, th.text, 2.0);
             }
-            let dot = if status.starts_with("Sent") || status.starts_with("Dry") { th.ok } else if status.is_empty() { th.text2 } else { th.bad };
+            let dot = match status_ok(&status) {
+                Some(true) => th.ok,
+                Some(false) => th.bad,
+                None => th.text2,
+            };
             p.disc((M + 4.0, H - 22.0), 4.0, dot);
         }
         SetBkMode(mem, TRANSPARENT as i32);
@@ -709,7 +743,7 @@ unsafe extern "system" fn wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LR
         }
         WM_KEYDOWN if key(h, w as u16) => 0,
         WM_SETTINGCHANGE => unsafe {
-            title_bar(h, &theme()); // dark or light, or the accent colour, may have changed
+            title_bar(h, &theme_refresh()); // dark or light, or the accent colour, may have changed
             InvalidateRect(h, null(), 0);
             0
         },
@@ -760,7 +794,7 @@ fn create(visible: bool) -> HWND {
         SCREEN.store(h as isize, Ordering::Relaxed);
         SendMessageW(h, WM_SETICON, ICON_SMALL as usize, crate::tray::icon(true) as isize);
         SendMessageW(h, WM_SETICON, ICON_BIG as usize, crate::tray::icon(false) as isize);
-        title_bar(h, &theme());
+        title_bar(h, &theme_refresh());
         if visible {
             ShowWindow(h, SW_SHOW);
         }
@@ -773,7 +807,10 @@ fn create(visible: bool) -> HWND {
 fn report(bt: bool, seq: u8, (l2, r2, [left, right]): Cmd, light: u8, glow: Option<ds::Glow>, v2: bool) -> Vec<u8> {
     let r = ds::trigger_report(bt, seq, Some(l2), Some(r2), None, ds::Rumble { left, right, v2 }).expect("effect_from keeps every value in range");
     let r = if light == NO_LIGHT { r } else { ds::with_mute_light(bt, r, light) };
-    glow.map_or(r.clone(), |g| ds::with_glow(bt, r, g))
+    match glow {
+        Some(g) => ds::with_glow(bt, r, g),
+        None => r,
+    }
 }
 
 /// Carries out the worker's writes: the controllers (`Hid`), or a test's closure.
@@ -1071,7 +1108,7 @@ fn worker(rx: mpsc::Receiver<Msg>, mut go: impl Writer) {
                         held.push(id);
                     }
                     if !was && on {
-                        *STATUS.lock().unwrap() = "A game has the controller: nothing is sent".into();
+                        *STATUS.lock().unwrap() = HELD.into();
                         unsafe { PostMessageW(SCREEN.load(Ordering::Relaxed) as HWND, WM_STATUS, 0, 0) };
                     }
                     if was && held.is_empty() && (sent || owed) {
@@ -1218,6 +1255,15 @@ pub(crate) mod tests {
     use super::*;
 
     #[test]
+    fn status_dot_colour() {
+        assert_eq!(status_ok(""), None);
+        assert_eq!(status_ok(HELD), None, "a game holding the controller is not an error");
+        assert_eq!(status_ok("Sent"), Some(true));
+        assert_eq!(status_ok("Dry run: 3 reports"), Some(true));
+        assert_eq!(status_ok("No controller found"), Some(false));
+    }
+
+    #[test]
     fn effects_stay_in_range() {
         for kind in 0..5 {
             let at = |f: fn((&str, u8, u8, u8)) -> u8| KNOBS[kind].map(|k| k.map_or(0, f));
@@ -1283,7 +1329,7 @@ pub(crate) mod tests {
 
     /// Tests that read the statics `LIGHT` and `GLOW` run one at a time.
     static LIGHTS: Mutex<()> = Mutex::new(());
-    /// Tests that set `RELEASED` (which stops `audio::paced`) run one at a time with the pacing test.
+    /// Tests that set the shared flags `RELEASED` (which stops `audio::paced`) or `ds::MIC` run one at a time with the pacing test.
     pub(crate) static HOLDS: Mutex<()> = Mutex::new(());
 
     /// While a game holds the controller nothing is written; taking it back sends the state once.
