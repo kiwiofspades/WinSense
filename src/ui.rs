@@ -7,7 +7,7 @@
 //! the window switches both triggers and the rumble off. `--dry` opens no controller and prints the reports.
 //! With `--pad` (opt-in: by default the DualSense stays itself) it also runs the virtual Xbox 360 pad (src/pad.rs); a game's rumble
 //! reaches the same worker, so it never wipes the trigger effects (every report carries both).
-//! Since 0.6.0 it also runs touchpad and gyro as mouse (src/mouse.rs, reads only) unless `--dry`.
+//! Since 0.6.0 it also runs the touchpad mouse (src/mouse.rs, reads only) unless `--dry`.
 //! Since 0.7.0 the tray program (src/tray.rs) opens the same window in its own process: there the
 //! worker lives as long as the tray, closing the window switches triggers and rumble off, and the
 //! tray runs the mouse.
@@ -76,6 +76,11 @@ pub enum Msg {
     /// played on top for a while (a part left None shows the lasting one).
     Leds(u32, ds::Glow),
     Blink(ds::Glow, std::time::Duration),
+    /// A client (its port id; 0 = the tray's "hands off while a game is in front") hands the
+    /// controller to a game (true) or takes it back (false). While anyone holds it nothing is sent.
+    Hold(u32, bool),
+    /// Windows says a device came or went (the tray's WM_DEVICECHANGE): look for controllers again.
+    Devices,
 }
 
 const DARK: ds::Glow = (None, None);
@@ -168,8 +173,20 @@ thread_local! {
 static SCREEN: AtomicIsize = AtomicIsize::new(0);
 /// Set by the tray: closing the window then keeps the worker and the message loop.
 pub static IN_TRAY: AtomicBool = AtomicBool::new(false);
-/// The worker drives a rumble motor right now: game sound as haptics waits (src/sound.rs).
-pub static RUMBLE: AtomicBool = AtomicBool::new(false);
+/// Someone holds the controller for a game (`port::set_hold`, which also tells the worker): the
+/// haptic thread (`audio::paced`), clips and voice send nothing meanwhile. Set by the holder's own
+/// thread, so a `reclaim` and a tone on the next line never race the worker.
+pub static RELEASED: AtomicBool = AtomicBool::new(false);
+/// The motors the worker last sent (left << 8 | right); not 0 = game sound as haptics waits
+/// (src/sound.rs), and the voice thread's speaker setup carries them (`rumble_for`).
+pub static SENT_MOTORS: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// The worker's current rumble in this controller's form, for a report written beside the worker.
+pub fn rumble_for(dev: &hidapi::HidDevice) -> ds::Rumble {
+    let m = SENT_MOTORS.load(Ordering::Relaxed);
+    let v2 = m != 0 && crate::vibration_v2(dev, dev.get_device_info().map_or(0x0CE6, |i| i.product_id()));
+    ds::Rumble { left: (m >> 8) as u8, right: m as u8, v2 }
+}
 /// The mute light the worker's next report carries (0 off, 1 on), `NO_LIGHT` = none: a report
 /// without it leaves the light as it is, so it is sent once per change.
 /// shortcut: taken by the next write even when no controller is there to get it; src/desk.rs only asks while one is connected.
@@ -178,10 +195,13 @@ const NO_LIGHT: u8 = 0xFF;
 /// A mod's lights for the worker's next report (`DARK` = give every light back), None = none:
 /// like `LIGHT`, sent once per change.
 static GLOW: Mutex<Option<ds::Glow>> = Mutex::new(None);
-/// This connection already got the light-bar setup report (Bluetooth holds the bar in its start-up
-/// animation until then; the driver sends it first). The mouse thread clears it at each connection.
-/// shortcut: one flag, so with two controllers only the first to be written gets the setup.
-pub static FADED: AtomicBool = AtomicBool::new(false);
+/// Counts device changes (`devices`), so the haptic thread (src/port.rs) looks for controllers again.
+pub static DEVICES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Counts the controller connections the mouse thread found (`linked`): a Bluetooth controller
+/// switched off and on keeps its HID path, so this is how a reconnect shows.
+pub static LINKS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The open controllers as `pad <id> connected usb|bt [full]` lines, for a pipe client's `hello`.
+pub static PADS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// The worker's last result, shown in the status line.
 static STATUS: Mutex<String> = Mutex::new(String::new());
 const WM_STATUS: u32 = WM_APP + 2;
@@ -528,7 +548,7 @@ fn paint(h: HWND) {
             let c = card(t);
             text(mem, 1, name, (c.0 + 14.0, c.1 + 10.0, 60.0, 24.0), th.text, DT_LEFT);
             if !side.is_empty() {
-                text(mem, 3, &format!("\u{00B7} {side}"), (c.0 + 38.0, c.1 + 10.0, c.2 - 52.0, 24.0), th.text2, DT_LEFT);
+                text(mem, 3, &format!("({side})"), (c.0 + 38.0, c.1 + 10.0, c.2 - 52.0, 24.0), th.text2, DT_LEFT);
             }
         }
         for t in 0..2 {
@@ -748,80 +768,258 @@ fn create(visible: bool) -> HWND {
     }
 }
 
-/// Write one command to every DualSense, or print it when there is no `api` (dry run).
-/// Returns the line for the status bar.
-fn write_all(api: Option<&mut hidapi::HidApi>, seq: u8, (l2, r2, [left, right]): Cmd) -> String {
-    let light = LIGHT.swap(NO_LIGHT, Ordering::Relaxed);
-    let glow = GLOW.lock().unwrap().take();
-    let report = |bt, v2| {
-        let r = ds::trigger_report(bt, seq, Some(l2), Some(r2), None, ds::Rumble { left, right, v2 }).expect("effect_from keeps every value in range");
-        let r = if light == NO_LIGHT { r } else { ds::with_mute_light(bt, r, light) };
-        glow.map_or(r.clone(), |g| ds::with_glow(bt, r, g))
-    };
-    let fade = glow.is_some_and(|g| g.0.is_some()) && !FADED.load(Ordering::Relaxed);
-    let setup = |v2| ds::output_report(true, seq, &ds::Lights::Setup, ds::Rumble { left, right, v2 }); // carries the rumble, so it does not stop it
-    let Some(api) = api else {
-        if fade {
-            FADED.store(true, Ordering::Relaxed);
-            println!("dry BT  {} (light bar setup, once per connection)", crate::hex(&setup(true)));
-        }
-        println!("dry USB {}\ndry BT  {}", crate::hex(&report(false, true)), crate::hex(&report(true, true)));
-        return "Dry run: reports printed, nothing sent".into();
-    };
-    // shortcut: looks for controllers again on every write, so a reconnect just works; keep them open if writes must get faster
-    let _ = api.refresh_devices();
-    let (mut sent, mut failed) = (Vec::new(), Vec::new());
-    for info in api.device_list().filter(|d| d.vendor_id() == ds::VID && ds::PIDS.contains(&d.product_id())) {
-        let bt = matches!(info.bus_type(), hidapi::BusType::Bluetooth);
-        let link = if bt { "Bluetooth" } else { "USB" };
-        // The rumble form is only looked up while rumbling: one feature report per write.
-        let write = |d: hidapi::HidDevice| {
-            let v2 = left | right != 0 && crate::vibration_v2(&d, info.product_id());
-            if bt && fade {
-                d.write(&setup(v2))?;
-                FADED.store(true, Ordering::Relaxed);
-            }
-            d.write(&report(bt, v2))
-        };
-        match info.open_device(api).and_then(write) {
-            Ok(_) => sent.push(link.to_string()),
-            Err(e) => failed.push(format!("{link} ({e})")),
-        }
+/// One report for one controller: triggers and rumble, with the mute light and a mod's lights
+/// when they changed (`LIGHT`, `GLOW`).
+fn report(bt: bool, seq: u8, (l2, r2, [left, right]): Cmd, light: u8, glow: Option<ds::Glow>, v2: bool) -> Vec<u8> {
+    let r = ds::trigger_report(bt, seq, Some(l2), Some(r2), None, ds::Rumble { left, right, v2 }).expect("effect_from keeps every value in range");
+    let r = if light == NO_LIGHT { r } else { ds::with_mute_light(bt, r, light) };
+    glow.map_or(r.clone(), |g| ds::with_glow(bt, r, g))
+}
+
+/// Carries out the worker's writes: the controllers (`Hid`), or a test's closure.
+trait Writer {
+    fn write(&mut self, c: Cmd) -> String;
+    /// Look for controllers again (Windows said a device came or went); true if one is new.
+    fn scan(&mut self) -> bool {
+        false
     }
-    match (sent.is_empty(), failed.is_empty()) {
-        (true, true) => "No DualSense is connected".into(),
-        (_, true) => format!("Sent to your DualSense ({})", sent.join(" and ")),
-        _ => format!("Could not send by {}", failed.join(", ")),
+    /// Time to look again without being told (none open, or one could not be opened).
+    fn due(&self) -> bool {
+        false
     }
 }
 
-/// The function that carries out one command: it owns the controllers (none when `dry`).
-fn sender(dry: bool) -> impl FnMut(Cmd) -> String {
-    let mut api = if dry { None } else { Some(hidapi::HidApi::new()) };
-    let mut seq = 0u8;
-    move |cmd| {
-        seq = (seq + 1) & 15;
-        match &mut api {
-            None => write_all(None, seq, cmd),
-            Some(Ok(api)) => write_all(Some(api), seq, cmd),
-            Some(Err(e)) => format!("Cannot reach HID devices: {e}"),
+impl<F: FnMut(Cmd) -> String> Writer for F {
+    fn write(&mut self, c: Cmd) -> String {
+        self(c)
+    }
+}
+
+/// One open DualSense.
+struct Pad {
+    /// For pipe clients that said `hello` (src/port.rs): counts up per connection, from 1.
+    id: u32,
+    path: std::ffi::CString,
+    dev: hidapi::HidDevice,
+    pid: u16,
+    bt: bool,
+    /// The rumble form (feature 0x20), read the first time it rumbles and kept: over Bluetooth the
+    /// read switches the controller to the long report, so not at connect.
+    v2: Option<bool>,
+    /// Failed 0x20 reads: after 3 the guess (v2) is kept.
+    tries: u8,
+    /// Bluetooth long report seen at connect, or caused by our first write (any 0x31 switches it).
+    full: bool,
+    /// Got the light-bar setup report (Bluetooth holds the bar in its start-up animation until then).
+    faded: bool,
+}
+
+impl Pad {
+    fn line(&self) -> String {
+        format!("pad {} connected {}{}", self.id, if self.bt { "bt" } else { "usb" }, if self.full { " full" } else { "" })
+    }
+}
+
+/// The controllers, kept open between writes. Looked for again when Windows says a device came or
+/// went (`Msg::Devices`); a failed write reopens that one.
+struct Pads {
+    api: hidapi::HidApi,
+    list: Vec<Pad>,
+    next: u32,
+    /// None open, or one could not be opened: look again at the next message from then on (the
+    /// tray is told when devices change; the trigger screen alone is not).
+    stale: Option<std::time::Instant>,
+    /// `LINKS` at the last look.
+    links: u32,
+}
+
+impl Pads {
+    /// Open new controllers, drop gone ones; true if one is new. Tells `hello` clients after the
+    /// list for a new `hello` is up to date, so none misses a line.
+    fn scan(&mut self) -> bool {
+        let _ = self.api.refresh_devices();
+        let found: Vec<hidapi::DeviceInfo> = self.api.device_list().filter(|d| d.vendor_id() == ds::VID && ds::PIDS.contains(&d.product_id())).cloned().collect();
+        let mut said = Vec::new();
+        self.list.retain(|p| {
+            let here = found.iter().any(|d| d.path() == p.path.as_c_str());
+            if !here {
+                said.push(format!("pad {} gone", p.id));
+            }
+            here
+        });
+        let fresh: Vec<&hidapi::DeviceInfo> = found.iter().filter(|d| !self.list.iter().any(|p| p.path.as_c_str() == d.path())).collect();
+        let mut new = false;
+        let links = LINKS.load(Ordering::Relaxed);
+        if links != self.links {
+            self.links = links;
+            // Reconnected on the same path: the old handle is dead, or the controller is back on the
+            // short report. One still on the long report never dropped (only a new link resets it).
+            let mut buf = [0u8; 80];
+            for p in self.list.iter_mut().filter(|p| p.bt && p.full) {
+                if p.dev.read_timeout(&mut buf, 30).map_or(true, |n| n > 0 && buf[0] != 0x31) {
+                    (p.faded, p.full, new) = (false, false, true);
+                }
+            }
+        }
+        self.stale = None;
+        for info in fresh {
+            let Ok(dev) = info.open_device(&self.api) else {
+                self.stale = Some(std::time::Instant::now() + std::time::Duration::from_secs(2)); // tried again before a write from then on
+                continue;
+            };
+            let bt = matches!(info.bus_type(), hidapi::BusType::Bluetooth);
+            let mut buf = [0u8; 80];
+            let full = !bt || dev.read_timeout(&mut buf, 30).is_ok_and(|n| n > 0 && buf[0] == 0x31); // reading changes nothing
+            self.next += 1;
+            let p = Pad { id: self.next, path: info.path().to_owned(), dev, pid: info.product_id(), bt, v2: None, tries: 0, full, faded: false };
+            said.push(p.line());
+            self.list.push(p);
+            new = true;
+        }
+        if self.list.is_empty() {
+            self.stale.get_or_insert(std::time::Instant::now() + std::time::Duration::from_secs(2));
+        }
+        self.publish(&said);
+        new
+    }
+
+    /// The list for a new `hello` first, then the lines for the clients already there.
+    fn publish(&self, said: &[String]) {
+        *PADS.lock().unwrap() = self.list.iter().map(Pad::line).collect();
+        said.iter().for_each(|l| crate::port::event(l));
+    }
+
+    /// Write to every controller; the line for the status bar. A failed write reopens that
+    /// controller and tries once more; one that cannot be opened is dropped.
+    fn write(&mut self, seq: u8, cmd: Cmd, light: u8, glow: Option<ds::Glow>) -> String {
+        let [left, right] = cmd.2;
+        let bar = glow.is_some_and(|g| g.0.is_some());
+        let one = |p: &mut Pad| {
+            // The rumble form, read the first time it rumbles; kept only when the read worked.
+            let v2 = left | right != 0
+                && p.v2.unwrap_or_else(|| {
+                    let mut f = [0u8; 64];
+                    f[0] = 0x20;
+                    let n = p.dev.get_feature_report(&mut f).unwrap_or(0);
+                    let v2 = ds::vibration_v2(p.pid, (n >= 46).then_some(&f[..]));
+                    p.tries += 1;
+                    p.v2 = (n >= 46 || p.tries >= 3).then_some(v2);
+                    v2
+                });
+            if p.bt && bar && !p.faded {
+                p.dev.write(&ds::output_report(true, seq, &ds::Lights::Setup, ds::Rumble { left, right, v2 }))?; // carries the rumble, so it does not stop it
+                p.faded = true;
+            }
+            p.dev.write(&report(p.bt, seq, cmd, light, glow, v2))
+        };
+        let (mut sent, mut failed, mut said) = (Vec::new(), Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < self.list.len() {
+            let p = &mut self.list[i];
+            let link = if p.bt { "Bluetooth" } else { "USB" };
+            let mut r = one(p);
+            if let Err(e) = &r {
+                said.push(format!("writefail {} {e}", p.id));
+                match self.api.open_path(&p.path) {
+                    Ok(dev) => {
+                        (p.dev, p.faded) = (dev, false); // maybe a new connection on the same path: its bar needs the setup again
+                        r = one(p);
+                    }
+                    Err(_) => {
+                        said.push(format!("pad {} gone", p.id));
+                        failed.push(format!("{link} ({})", r.unwrap_err()));
+                        self.list.remove(i);
+                        self.stale = Some(std::time::Instant::now());
+                        continue;
+                    }
+                }
+            }
+            match r {
+                Ok(_) => {
+                    sent.push(link);
+                    if !p.full {
+                        p.full = true;
+                        said.push(format!("pad {} full", p.id));
+                    }
+                }
+                Err(e) => failed.push(format!("{link} ({e})")),
+            }
+            i += 1;
+        }
+        self.publish(&said);
+        match (sent.is_empty(), failed.is_empty()) {
+            (true, true) => "No DualSense is connected".into(),
+            (_, true) => format!("Sent to your DualSense ({})", sent.join(" and ")),
+            _ => format!("Could not send by {}", failed.join(", ")),
         }
     }
+}
+
+/// The worker's writer: the open controllers, None = a dry run that prints the reports.
+struct Hid {
+    pads: Option<Result<Pads, String>>,
+    seq: u8,
+    /// Dry run: the light-bar setup was printed.
+    faded: bool,
+}
+
+impl Writer for Hid {
+    fn write(&mut self, cmd: Cmd) -> String {
+        self.seq = (self.seq + 1) & 15;
+        let (light, glow) = (LIGHT.swap(NO_LIGHT, Ordering::Relaxed), GLOW.lock().unwrap().take());
+        match &mut self.pads {
+            Some(Ok(p)) => p.write(self.seq, cmd, light, glow),
+            Some(Err(e)) => format!("Cannot reach HID devices: {e}"),
+            None => {
+                if glow.is_some_and(|g| g.0.is_some()) && !self.faded {
+                    self.faded = true;
+                    println!("dry BT  {} (light bar setup, once per connection)", crate::hex(&ds::output_report(true, self.seq, &ds::Lights::Setup, ds::Rumble { left: cmd.2[0], right: cmd.2[1], v2: true })));
+                }
+                let at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_micros(); // for latency checks against a client's clock
+                println!("dry at {at}\ndry USB {}\ndry BT  {}", crate::hex(&report(false, self.seq, cmd, light, glow, true)), crate::hex(&report(true, self.seq, cmd, light, glow, true)));
+                "Dry run: reports printed, nothing sent".into()
+            }
+        }
+    }
+
+    fn scan(&mut self) -> bool {
+        match &mut self.pads {
+            Some(Ok(p)) => p.scan(),
+            _ => false,
+        }
+    }
+
+    fn due(&self) -> bool {
+        matches!(&self.pads, Some(Ok(p)) if p.stale.is_some_and(|t| t <= std::time::Instant::now()))
+    }
+}
+
+/// The worker's writer; it opens the controllers (none when `dry`).
+fn sender(dry: bool) -> Hid {
+    let open = || {
+        let mut p = Pads { api: hidapi::HidApi::new().map_err(|e| e.to_string())?, list: Vec::new(), next: 0, stale: None, links: LINKS.load(Ordering::Relaxed) };
+        p.scan();
+        Ok(p)
+    };
+    Hid { pads: (!dry).then(open), seq: 0, faded: false }
 }
 
 /// Carries out the newest state, reports to the status line, and switches both
 /// triggers and the rumble off once the window, the pad and the port are gone (an effect outlives the program).
-fn worker(rx: mpsc::Receiver<Msg>, mut go: impl FnMut(Cmd) -> String) {
+fn worker(rx: mpsc::Receiver<Msg>, mut go: impl Writer) {
     use std::time::Instant;
     let (mut ui, mut game, mut sent) = (OFF, [0u8; 2], false);
     let (mut m, mut pulse): (Option<(u32, Cmd)>, Option<(Cmd, Instant)>) = (None, None);
     let mut tone: Option<Instant> = None;
     // A mod's lights: lasting (with its owner), on top for a while, and what the controller shows now.
     let (mut leds, mut blink, mut lit): ((u32, ds::Glow), Option<(ds::Glow, Instant)>, ds::Glow) = ((0, DARK), None, DARK);
-    let mut mute = false; // the mute light is lit (src/desk.rs)
+    let mut mute: Option<bool> = None; // the mute light is lit (src/desk.rs); None = never set
+    // Who holds the controller for a game (`Msg::Hold`), and whether anything changed meanwhile.
+    let (mut held, mut owed): (Vec<u32>, bool) = (Vec::new(), false);
+    let mut rescan: Option<Instant> = None; // a second after the last device change (Windows sends several)
     loop {
-        // Wait for a message, or until a pulse or a tone ends.
-        let first = match pulse.map(|p| p.1).into_iter().chain(tone).chain(blink.map(|b| b.1)).min() {
+        // Wait for a message, or until a pulse, a tone or a blink ends, or it is time to look for controllers.
+        let first = match pulse.map(|p| p.1).into_iter().chain(tone).chain(blink.map(|b| b.1)).chain(rescan).min() {
             Some(end) => match rx.recv_timeout(end.saturating_duration_since(Instant::now())) {
                 Ok(msg) => Some(msg),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
@@ -832,10 +1030,18 @@ fn worker(rx: mpsc::Receiver<Msg>, mut go: impl FnMut(Cmd) -> String) {
                 Err(_) => break,
             },
         };
-        let mut changed = first.is_none();
-        if first.is_none() {
-            let now = Instant::now();
-            (pulse, tone, blink) = (pulse.filter(|p| p.1 > now), tone.filter(|&t| t > now), blink.filter(|b| b.1 > now));
+        // What has ended, whether woken by the clock or by a message (a steady stream of game rumble must not hold it up).
+        let now = Instant::now();
+        let timed = |p: &Option<(Cmd, Instant)>, t: &Option<Instant>, b: &Option<(ds::Glow, Instant)>| (p.is_some(), t.is_some(), b.is_some());
+        let was = timed(&pulse, &tone, &blink);
+        (pulse, tone, blink) = (pulse.filter(|p| p.1 > now), tone.filter(|&t| t > now), blink.filter(|b| b.1 > now));
+        let (mut changed, mut resend) = (timed(&pulse, &tone, &blink) != was, false);
+        if rescan.is_some_and(|t| t <= now) || go.due() {
+            rescan = None;
+            // A controller that comes gets what the others show, if there is anything to show:
+            // a write switches a Bluetooth one to the long report, which plain readers cannot read.
+            let showing = merge(ui, game, m.map(|m| m.1), pulse.map(|p| p.0)) != OFF || glow(leds.1, blink.map(|b| b.0)) != DARK || mute == Some(true);
+            resend = go.scan() && showing;
         }
         // A slider drag or a game queues many; only the newest of each matters.
         for msg in first.into_iter().chain(rx.try_iter()) {
@@ -852,15 +1058,45 @@ fn worker(rx: mpsc::Receiver<Msg>, mut go: impl FnMut(Cmd) -> String) {
                 Msg::Tone(d) => (tone, changed) = ((!d.is_zero()).then(|| Instant::now() + d), true),
                 Msg::Light(v) => {
                     LIGHT.store(v, Ordering::Relaxed);
-                    (mute, changed) = (v == 1, true);
+                    (mute, changed) = (Some(v == 1), true);
                 }
                 Msg::Leds(id, g) if g != DARK => (leds, changed) = ((id, g), true),
                 Msg::Leds(id, _) if leds.0 == id && leds.1 != DARK => (leds, changed) = ((id, DARK), true),
                 Msg::Leds(..) => {}
                 Msg::Blink(g, d) => (blink, changed) = (Some((g, Instant::now() + d)), true),
+                Msg::Hold(id, on) => {
+                    let was = !held.is_empty();
+                    held.retain(|&h| h != id);
+                    if on {
+                        held.push(id);
+                    }
+                    if !was && on {
+                        *STATUS.lock().unwrap() = "A game has the controller: nothing is sent".into();
+                        unsafe { PostMessageW(SCREEN.load(Ordering::Relaxed) as HWND, WM_STATUS, 0, 0) };
+                    }
+                    if was && held.is_empty() && (sent || owed) {
+                        (resend, owed) = (true, false); // taken back: the game changed what the controller shows
+                    }
+                }
+                Msg::Devices => rescan = Some(Instant::now() + std::time::Duration::from_secs(1)),
+            }
+        }
+        if resend {
+            // All of it once: triggers and rumble ride in every report, the lights only when asked.
+            changed = true;
+            let want = glow(leds.1, blink.map(|b| b.0));
+            if want != DARK {
+                *GLOW.lock().unwrap() = Some(want);
+            }
+            if let Some(m) = mute {
+                LIGHT.store(m as u8, Ordering::Relaxed);
             }
         }
         if !changed {
+            continue;
+        }
+        if !held.is_empty() {
+            owed = true; // sent once it is taken back
             continue;
         }
         sent = true;
@@ -871,15 +1107,15 @@ fn worker(rx: mpsc::Receiver<Msg>, mut go: impl FnMut(Cmd) -> String) {
             // without rumble bits hands the grips back to the tone; the rumble returns after it.
             c.2 = [0, 0];
         }
-        RUMBLE.store(c.2 != [0, 0], Ordering::Relaxed);
+        SENT_MOTORS.store(u16::from_be_bytes(c.2), Ordering::Relaxed);
         let want = glow(leds.1, blink.map(|b| b.0));
         if want != lit {
             if lit.0.is_some() && want.0.is_none() || lit.1.is_some() && want.1.is_none() {
                 // A light is given back. The release bit hands back every light, so it goes alone
                 // and what stays lit (the other light, the mute light) follows in the next report.
                 *GLOW.lock().unwrap() = Some(DARK);
-                go(c);
-                if mute {
+                go.write(c);
+                if mute == Some(true) {
                     LIGHT.store(1, Ordering::Relaxed);
                 }
             }
@@ -888,16 +1124,16 @@ fn worker(rx: mpsc::Receiver<Msg>, mut go: impl FnMut(Cmd) -> String) {
             }
             lit = want;
         }
-        *STATUS.lock().unwrap() = go(c);
+        *STATUS.lock().unwrap() = go.write(c);
         unsafe { PostMessageW(SCREEN.load(Ordering::Relaxed) as HWND, WM_STATUS, 0, 0) };
     }
     crate::power::EFFECT.store(false, Ordering::Relaxed);
-    RUMBLE.store(false, Ordering::Relaxed);
+    SENT_MOTORS.store(0, Ordering::Relaxed);
     if lit != DARK {
         *GLOW.lock().unwrap() = Some(DARK); // a mod's lights are still on: the closing report hands them back
     }
-    if sent {
-        go(OFF);
+    if sent && held.is_empty() {
+        go.write(OFF); // while a game holds the controller, quitting leaves it alone
     }
 }
 
@@ -907,6 +1143,20 @@ pub fn start(dry: bool) -> (mpsc::Sender<Msg>, std::thread::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     TX.set(Some(tx.clone()));
     (tx, std::thread::spawn(move || worker(rx, sender(dry))))
+}
+
+/// For the tray (its window thread): a device came or went.
+pub fn devices() {
+    DEVICES.fetch_add(1, Ordering::Relaxed);
+    TX.with_borrow(|tx| tx.as_ref().map(|tx| tx.send(Msg::Devices)));
+}
+
+/// For the mouse thread: a Bluetooth controller it found reads (maybe the same one back on its old path). The
+/// worker and the haptic thread look again, so it gets its setup and lights.
+pub fn linked() {
+    LINKS.fetch_add(1, Ordering::Relaxed);
+    DEVICES.fetch_add(1, Ordering::Relaxed);
+    crate::port::rescan();
 }
 
 /// For the tray: show the window (made if not open).
@@ -935,7 +1185,7 @@ pub fn stop(worker: std::thread::JoinHandle<()>) {
 pub fn run(dry: bool, with_pad: bool) {
     let (game, worker) = start(dry);
     let h = create(true);
-    // Touchpad and gyro as mouse: reads only, so it needs nothing from the worker (src/mouse.rs).
+    // The touchpad mouse: reads only, so it needs nothing from the worker (src/mouse.rs).
     let stop_mouse = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mouse = (!dry).then(|| {
         let stop = stop_mouse.clone();
@@ -964,7 +1214,7 @@ pub fn run(dry: bool, with_pad: bool) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1033,6 +1283,81 @@ mod tests {
 
     /// Tests that read the statics `LIGHT` and `GLOW` run one at a time.
     static LIGHTS: Mutex<()> = Mutex::new(());
+    /// Tests that set `RELEASED` (which stops `audio::paced`) run one at a time with the pacing test.
+    pub(crate) static HOLDS: Mutex<()> = Mutex::new(());
+
+    /// While a game holds the controller nothing is written; taking it back sends the state once.
+    #[test]
+    fn a_held_controller_gets_nothing_until_taken_back() {
+        let _one = LIGHTS.lock().unwrap();
+        let _two = HOLDS.lock().unwrap();
+        // One message at a time, each handled before the next comes.
+        let run = |cmds: &[Msg]| {
+            let (tx, rx) = mpsc::channel();
+            let w = std::thread::spawn(move || {
+                let mut done = Vec::new();
+                worker(rx, |c| {
+                    done.push((c, GLOW.lock().unwrap().take(), LIGHT.swap(NO_LIGHT, Ordering::Relaxed)));
+                    String::new()
+                });
+                done
+            });
+            for &c in cmds {
+                tx.send(c).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(60));
+            }
+            drop(tx);
+            w.join().unwrap().into_iter().map(|d| (d.0, d.1, (d.2 != NO_LIGHT).then_some(d.2))).collect::<Vec<_>>()
+        };
+        let wall = Effect::Resist { start: 5, strength: 8 };
+        let (w, hold, back) = (|c| Msg::Mod(1, Some(c)), Msg::Hold(1, true), Msg::Hold(1, false));
+        let state = (wall, Effect::Off, [0, 0]);
+        assert_eq!(run(&[hold, w(state)]), [], "held: nothing, and Quit leaves the game's controller alone");
+        assert_eq!(run(&[hold, w(state), back]), [(state, None, None), (OFF, None, None)], "a change made while held goes out once on reclaim");
+        assert_eq!(run(&[hold, back]), [], "nothing was ever sent: taking it back writes nothing");
+        let two = [w(state), hold, Msg::Hold(0, true), back];
+        assert_eq!(run(&two), [(state, None, None)], "the first write, then nothing while the tray still holds it");
+        let mut both = two.to_vec();
+        both.push(Msg::Hold(0, false));
+        assert_eq!(run(&both), [(state, None, None), (state, None, None), (OFF, None, None)], "free once both let go: the state again");
+        let blue = Some([0, 0, 255]);
+        let lit = run(&[Msg::Leds(1, (blue, None)), Msg::Light(1), hold, back]);
+        assert_eq!(lit[2], (OFF, Some((blue, None)), Some(1)), "taking it back puts the bar and the mute light back too: {lit:?}");
+    }
+
+    /// A controller found by a look the worker made on its own (none open before) gets the whole state.
+    #[test]
+    fn a_controller_found_late_gets_the_lights_too() {
+        let _one = LIGHTS.lock().unwrap();
+        struct Late(std::sync::Arc<AtomicBool>, std::sync::Arc<Mutex<Vec<(Cmd, Option<ds::Glow>)>>>);
+        impl Writer for Late {
+            fn write(&mut self, c: Cmd) -> String {
+                self.1.lock().unwrap().push((c, GLOW.lock().unwrap().take()));
+                String::new()
+            }
+            fn scan(&mut self) -> bool {
+                !self.0.swap(false, Ordering::Relaxed) // one look finds it
+            }
+            fn due(&self) -> bool {
+                !self.0.load(Ordering::Relaxed)
+            }
+        }
+        let looked = std::sync::Arc::new(AtomicBool::new(true));
+        let (tx, rx) = mpsc::channel();
+        let done = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let go = Late(looked.clone(), done.clone());
+        let w = std::thread::spawn(move || worker(rx, go));
+        let (blue, wall) = (Some([0, 0, 255]), Effect::Resist { start: 5, strength: 8 });
+        tx.send(Msg::Leds(1, (blue, None))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        looked.store(false, Ordering::Relaxed); // now a look is due
+        tx.send(Msg::Ui((wall, Effect::Off, [0, 0]))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        drop(tx);
+        w.join().unwrap();
+        let done = done.lock().unwrap();
+        assert_eq!(done[1], ((wall, Effect::Off, [0, 0]), Some((blue, None))), "the bar goes out again with the next write: {done:?}");
+    }
 
     /// The mute light rides in a report that carries the triggers and rumble as they are.
     #[test]
@@ -1045,7 +1370,7 @@ mod tests {
         drop(tx);
         let mut done = Vec::new();
         worker(rx, |c| {
-            done.push((c, LIGHT.swap(NO_LIGHT, Ordering::Relaxed))); // what write_all does
+            done.push((c, LIGHT.swap(NO_LIGHT, Ordering::Relaxed))); // what Hid::write does
             String::new()
         });
         assert_eq!(done, [((wall, Effect::Off, [90, 0]), 1), (OFF, NO_LIGHT)], "one report with the light and the wall; the closing one leaves the light alone");
@@ -1078,7 +1403,7 @@ mod tests {
             let t = std::thread::spawn(move || {
                 let mut done = Vec::new();
                 worker(rx, |c| {
-                    done.push((c, GLOW.lock().unwrap().take(), LIGHT.swap(NO_LIGHT, Ordering::Relaxed))); // what write_all does
+                    done.push((c, GLOW.lock().unwrap().take(), LIGHT.swap(NO_LIGHT, Ordering::Relaxed))); // what Hid::write does
                     String::new()
                 });
                 done

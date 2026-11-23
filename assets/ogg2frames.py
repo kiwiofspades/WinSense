@@ -1,4 +1,9 @@
-# Strip an Ogg Opus file into raw packets, written as 72-byte records (counter + 71 bytes) like `winsense mic`.
+# Strip an Ogg Opus file into its raw audio packets. Run: python ogg2frames.py <in.ogg> <out.bin> [size]
+# Three output modes, by [size]:
+#   none: the packets back to back, as they are.
+#   71:   72-byte records (a counter byte + the packet padded to 71), like `winsense mic`.
+#   else: each packet padded with zeros to [size] bytes (the clips use 200).
+# A packet longer than [size] stops the run: cutting it would corrupt the clip.
 import sys
 data=open(sys.argv[1],'rb').read(); pos=0; packets=[]; cur=b''
 while pos < len(data):
@@ -14,6 +19,8 @@ print(len(audio),'packets, sizes',sizes,'tocs',[hex(t) for t in tocs])
 want=int(sys.argv[3]) if len(sys.argv)>3 else None
 out=bytearray()
 for i,p in enumerate(audio):
-    if want: p=p[:want].ljust(want,b'\0')
+    if want:
+        if len(p)>want: sys.exit(f'packet {i} is {len(p)} bytes, more than {want}: encode at a lower bitrate')
+        p=p.ljust(want,b'\0')
     out+=bytes([i&255])+p if want==71 else p
 open(sys.argv[2],'wb').write(out)

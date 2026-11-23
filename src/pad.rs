@@ -72,6 +72,9 @@ impl Bus {
             let h = self.0 as HANDLE;
             let mut ov: OVERLAPPED = std::mem::zeroed();
             ov.hEvent = CreateEventW(null(), 1, 0, null());
+            if ov.hEvent.is_null() {
+                return Err(GetLastError());
+            }
             let (mut n, p) = (0u32, buf.as_mut_ptr());
             let ok = DeviceIoControl(h, code, p as _, buf.len() as u32, if reply { p as _ } else { null_mut() }, if reply { buf.len() as u32 } else { 0 }, &mut n, &mut ov);
             let r = if (ok != 0 || GetLastError() == ERROR_IO_PENDING) && GetOverlappedResult(h, &ov, &mut n, 1) != 0 { Ok(()) } else { Err(GetLastError()) };
@@ -83,23 +86,29 @@ impl Bus {
     /// Plug in an Xbox 360 pad (045E:028E) on the first free serial (1-16, never 0) and wait
     /// until it can take reports. Returns its serial.
     pub fn plug_x360(&self) -> Result<u32, String> {
+        let mut last = 0;
         for serial in 1..=16 {
             // VIGEM_PLUGIN_TARGET: Size 16, SerialNo, TargetType 0 (Xbox360Wired), VendorId, ProductId.
             let mut p = words(&[16, serial, 0, 0x028E_045E], 16);
-            if self.ioctl(PLUGIN, &mut p, false).is_ok() {
-                return match self.ioctl(WAIT_READY, &mut words(&[8, serial], 8), false) {
-                    Ok(()) => Ok(serial),
-                    Err(e) => Err(format!("virtual pad plugged in but never became ready (error {e})")),
-                };
+            match self.ioctl(PLUGIN, &mut p, false) {
+                Ok(()) => {
+                    return match self.ioctl(WAIT_READY, &mut words(&[8, serial], 8), false) {
+                        Ok(()) => Ok(serial),
+                        Err(e) => Err(format!("virtual pad plugged in but never became ready (error {e})")),
+                    };
+                }
+                Err(e) => last = e, // most likely that serial is taken: try the next
             }
         }
-        Err("ViGEmBus has no free slot".into())
+        Err(format!("ViGEmBus took no virtual pad on any of its 16 slots (last error {last})"))
     }
 
     /// XUSB_SUBMIT_REPORT: Size 20, SerialNo, then the 12-byte XINPUT_GAMEPAD-shaped report.
     pub fn submit(&self, serial: u32, report: &[u8; 12]) -> Result<(), u32> {
-        let mut b = words(&[20, serial], 8);
-        b.extend_from_slice(report);
+        let mut b = [0u8; 20]; // on the stack: this runs for every input report
+        b[..4].copy_from_slice(&20u32.to_le_bytes());
+        b[4..8].copy_from_slice(&serial.to_le_bytes());
+        b[8..].copy_from_slice(report);
         self.ioctl(XUSB_SUBMIT, &mut b, false)
     }
 
@@ -158,11 +167,13 @@ impl Pad {
         let stop = Arc::new(AtomicBool::new(false));
         let (b, s) = (bus.clone(), stop.clone());
         let feeder = std::thread::spawn(move || feed(&b, serial, &s));
-        let b = bus.clone();
+        let (b, s) = (bus.clone(), stop.clone());
         let mut on_rumble = on_rumble;
         let rumbler = std::thread::spawn(move || {
             // Ends when Drop cancels the pending request (or the bus goes away).
-            while let Ok(m) = b.rumble(serial) {
+            while !s.load(Ordering::Relaxed)
+                && let Ok(m) = b.rumble(serial)
+            {
                 on_rumble(m);
             }
         });
@@ -173,8 +184,12 @@ impl Pad {
 impl Drop for Pad {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        unsafe { CancelIoEx(self.bus.0 as HANDLE, null()) }; // frees the waiting rumble request
         for t in self.threads.drain(..) {
+            // Cancel until it ends: a single cancel can land between two rumble requests and miss the next.
+            while !t.is_finished() {
+                unsafe { CancelIoEx(self.bus.0 as HANDLE, null()) };
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             let _ = t.join();
         }
         // The last Arc<Bus> drops here: closing the bus unplugs the pad.
@@ -194,7 +209,12 @@ fn feed(bus: &Bus, serial: u32, stop: &AtomicBool) {
             Some((matches!(info.bus_type(), hidapi::BusType::Bluetooth), info.open_device(&api).ok()?))
         });
         let Some((bt, dev)) = found else {
-            std::thread::sleep(std::time::Duration::from_secs(1));
+            for _ in 0..10 {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
             continue;
         };
         if bt {

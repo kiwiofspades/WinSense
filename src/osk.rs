@@ -18,7 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use windows_sys::w;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Kind {
+enum Kind {
     /// What the key types on the letters layer and on the symbols layer.
     Ch(&'static str, &'static str),
     Shift,
@@ -36,7 +36,7 @@ const fn k(a: &'static str, b: &'static str) -> (f32, Kind) {
 /// The keys, row by row: (width in key units, key). Every row is centred in 10 units.
 /// Made for search boxes and addresses: digits, letters, `.`, `/`, `.com` without leaving the
 /// letters; the rest of the punctuation is on the symbols layer.
-pub const ROWS: [&[(f32, Kind)]; 5] = [
+const ROWS: [&[(f32, Kind)]; 5] = [
     &[k("1", "1"), k("2", "2"), k("3", "3"), k("4", "4"), k("5", "5"), k("6", "6"), k("7", "7"), k("8", "8"), k("9", "9"), k("0", "0")],
     &[k("q", "!"), k("w", "@"), k("e", "#"), k("r", "$"), k("t", "%"), k("y", "^"), k("u", "&"), k("i", "*"), k("o", "("), k("p", ")")],
     &[k("a", "-"), k("s", "_"), k("d", "="), k("f", "+"), k("g", ":"), k("h", ";"), k("j", "'"), k("k", "\""), k("l", "~")],
@@ -72,7 +72,7 @@ pub struct Board {
 }
 
 /// Left and right edge of a key, in key units.
-pub fn span(row: usize, col: usize) -> (f32, f32) {
+fn span(row: usize, col: usize) -> (f32, f32) {
     let keys = ROWS[row];
     let off = (10.0 - keys.iter().map(|k| k.0).sum::<f32>()) / 2.0;
     let x0 = off + keys[..col].iter().map(|k| k.0).sum::<f32>();
@@ -108,7 +108,7 @@ impl Board {
     }
 
     /// What a character key shows and types now; empty for the others (they are drawn as icons).
-    pub fn label(&self, row: usize, col: usize) -> String {
+    fn label(&self, row: usize, col: usize) -> String {
         match ROWS[row][col].1 {
             Ch(_, s) if self.sym => s.into(),
             Ch(a, _) if self.shift && a.len() == 1 => a.to_uppercase(),
@@ -230,7 +230,7 @@ fn paint(h: HWND) {
                     }
                 }
             }
-            let hint = "Cross type  \u{00B7}  Square delete  \u{00B7}  Triangle space  \u{00B7}  L1 shift  \u{00B7}  R1 symbols  \u{00B7}  R2 enter  \u{00B7}  Circle close";
+            let hint = "Cross type | Square delete | Triangle space | L1 shift | R1 symbols | R2 enter | Circle close";
             ui::text_with(mem, f[1], hint, (PAD, H - 30.0, W - 2.0 * PAD, 22.0), th.text2, DT_CENTER);
         });
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);

@@ -10,6 +10,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Networking::WinHttp::*;
 use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 use windows_sys::w;
+use crate::ui::wide;
 
 pub const REPO: &str = "kiwiofspades/WinSense";
 /// The exe and its checksum file, as attached to every release.
@@ -17,8 +18,9 @@ const EXE: &str = "winsense.exe";
 const SUM: &str = "winsense.exe.sha256";
 /// The only hosts a request or a redirect may go to.
 const HOSTS: [&str; 4] = ["api.github.com", "github.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com"];
-/// The largest download taken (the exe is about 1.5 MB).
+/// The largest download taken (the exe is about 1.5 MB), and the longest one may take.
 const LIMIT: usize = 32 << 20;
+const DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// A release newer than this build.
 #[derive(Clone, Debug, PartialEq)]
@@ -90,10 +92,6 @@ fn split(url: &str) -> Option<(&str, &str)> {
     HOSTS.contains(&host.to_ascii_lowercase().as_str()).then_some((host, path))
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain([0]).collect()
-}
-
 /// Closes a WinHTTP handle when dropped.
 struct H(*mut core::ffi::c_void);
 impl Drop for H {
@@ -115,7 +113,8 @@ fn get(url: &str) -> Result<Vec<u8>, String> {
     if session.0.is_null() {
         return Err(last_error("WinHttpOpen"));
     }
-    unsafe { WinHttpSetTimeouts(session.0, 10_000, 10_000, 15_000, 30_000) };
+    unsafe { WinHttpSetTimeouts(session.0, 10_000, 10_000, 15_000, 30_000) }; // per call; DEADLINE caps a trickle
+    let start = std::time::Instant::now();
     let mut url = url.to_string();
     for _ in 0..6 {
         let (host, path) = split(&url).ok_or_else(|| format!("refused to go to {url}"))?;
@@ -166,6 +165,9 @@ fn get(url: &str) -> Result<Vec<u8>, String> {
             if body.len() > LIMIT {
                 return Err("download too large".into());
             }
+            if start.elapsed() > DEADLINE {
+                return Err("download too slow".into());
+            }
         }
     }
     Err("too many redirects".into())
@@ -188,23 +190,34 @@ pub fn install(r: &Release, args: &[&str]) -> Result<(), String> {
     }
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let (new, old) = (me.with_extension("exe.new"), me.with_extension("exe.old"));
-    std::fs::write(&new, &exe).map_err(|e| format!("could not save the download: {e}"))?;
+    // Flushed to disk before the renames, so a power cut cannot leave a short exe in place.
+    let saved = std::fs::File::create(&new).and_then(|mut f| std::io::Write::write_all(&mut f, &exe).and_then(|_| f.sync_all()));
+    if let Err(e) = saved {
+        let _ = std::fs::remove_file(&new);
+        return Err(format!("could not save the download: {e}"));
+    }
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(&me, &old).map_err(|e| format!("could not move the running exe aside: {e}"))?;
+    if let Err(e) = std::fs::rename(&me, &old) {
+        let _ = std::fs::remove_file(&new);
+        return Err(format!("could not move the running exe aside: {e}"));
+    }
     if let Err(e) = std::fs::rename(&new, &me) {
         let _ = std::fs::rename(&old, &me);
+        let _ = std::fs::remove_file(&new);
         return Err(format!("could not put the new exe in place: {e}"));
     }
     let pid = std::process::id().to_string();
     if let Err(e) = std::process::Command::new(&me).args(args).args(["--after", &pid]).spawn() {
         let _ = std::fs::rename(&me, &new);
         let _ = std::fs::rename(&old, &me);
+        let _ = std::fs::remove_file(&new);
         return Err(format!("could not start the new version: {e}"));
     }
     Ok(())
 }
 
-/// The exe an earlier update moved aside; it can go once the new version runs.
+/// The exe an earlier update moved aside; it can go once the new version runs. (Not `.new`:
+/// a dry tray also tidies, and could catch a real update between its write and its rename.)
 pub fn tidy() {
     if let Ok(me) = std::env::current_exe() {
         let _ = std::fs::remove_file(me.with_extension("exe.old"));

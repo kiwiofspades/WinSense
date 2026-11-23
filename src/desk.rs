@@ -113,7 +113,7 @@ fn listed(l: &UserNotificationListener) -> Option<Vec<u32>> {
     Some(all.into_iter().filter_map(|n| n.Id().ok()).collect())
 }
 
-/// The tray's thread for both toggles; costs two sleeps a second while both are off. Ends by
+/// The tray's thread for both toggles; wakes about three times a second, and does nothing more while both are off. Ends by
 /// putting out a light it lit. `dry`: prints what it reads, and the buzz does not wait for a controller.
 pub fn run(stop: &AtomicBool, tx: Sender<Msg>, dry: bool) {
     unsafe {
@@ -128,6 +128,9 @@ pub fn run(stop: &AtomicBool, tx: Sender<Msg>, dry: bool) {
         }
         let on = LIGHT_ON.load(Relaxed);
         let muted = if on { mic().map(|(muted, peak)| hush.step(peak, Instant::now()) || muted) } else { None };
+        if muted.is_none() {
+            hush = Hush::default(); // a silence from before the toggle went off never counts
+        }
         if dry && on && muted != was {
             println!("dry mic light: PC mic muted = {muted:?}");
             was = muted;

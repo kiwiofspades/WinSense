@@ -3,6 +3,7 @@
 Run: python assets/clips.py <out folder>, then for each wav the recipe in docs/modding.md ("Making
 clips"): ffmpeg to 200-byte Opus frames, then assets/ogg2frames.py to assets/<name>.bin.
 Bell-like notes (a sine, a soft octave above, fast attack, exponential decay), like the dings.
+Not `alert`: the shipped alert.bin is a Konami clip (see CREDITS.md), so it is left out here.
 """
 import math, random, struct, sys, wave
 
@@ -32,7 +33,6 @@ def hiss(at, secs, level=0.25):
 
 CLIPS = {
     "pickup": [note(1318.5, 0.0, 0.12), note(1975.5, 0.07, 0.25)],                       # E6 then B6
-    "alert": [note(523.3, 0.0, 0.16, 0.6), note(415.3, 0.2, 0.3, 0.6)],                  # C5 then G#4, falling
     "radio": [note(2400, 0.0, 0.03, 0.6), hiss(0.01, 0.16), note(1800, 0.18, 0.03, 0.5)],  # click, hiss, click
     "levelup": [note(1046.5, 0.0, 0.14), note(1318.5, 0.08, 0.14), note(1568.0, 0.16, 0.14), note(2093.0, 0.24, 0.32)],  # C6 E6 G6 C7
 }

@@ -4,14 +4,17 @@ WinSense runs in the tray. Click its icon (left or right button) to open the men
 through the menu from top to bottom, then the controller's buttons, voice commands and the test
 commands.
 
-Everything that changes how the controller or the PC behaves starts **off**. WinSense remembers
-what you tick (per Windows user, under `HKEY_CURRENT_USER\Software\WinSense`).
+On from the start: the touchpad mouse, voice commands on hold-Mute, the mod port, the low-battery
+balloon and the daily update check. Off until you tick them: couch mode, game sound as haptics,
+the mute light, the notification buzz, hands off, turn off when idle and start with Windows.
+WinSense remembers those ticks (per Windows user, under `HKEY_CURRENT_USER\Software\WinSense`).
+The touchpad mouse is on again each time WinSense starts.
 
 ## The tray menu
 
 ### Status lines
 
-The first grey line says whether a DualSense is connected and whether the touchpad or gyro mouse
+The first grey line says whether a DualSense is connected and whether the touchpad mouse
 is on. The second shows the battery, for example "Battery 85%" or "Battery 35%, charging". Hover
 over the icon to see the same two lines.
 
@@ -46,9 +49,10 @@ WinSense switches off whatever it set when you close the screen or quit.
 
 ### Touchpad mouse
 
-Ticks or unticks the touchpad mouse. You can also switch it with the controller: hold a finger
-still on the touchpad for about half a second. A chime from the controller's speaker confirms it
-(over Bluetooth).
+Ticks or unticks the touchpad mouse; it is ticked when WinSense starts. On the cable it works at
+once. Over Bluetooth it starts working after you hold a finger still on the touchpad for about half
+a second, and a chime from the controller's speaker confirms it. After that the same long press
+switches it off and on.
 
 While it is on:
 
@@ -56,13 +60,7 @@ While it is on:
 - Click the touchpad for a left click; click with two fingers down for a right click.
 - R2 is a left click and L2 a right click while a finger rests on the pad.
 
-### Gyro mouse
-
-Tilt the controller to move the cursor. Switch it with the menu, or hold **Create** and click the
-touchpad. While it is on, R2 is a left click and L2 a right click.
-
-WinSense learns the gyro's resting point slowly while the controller lies still, so the cursor
-does not drift. Windows' pointer speed setting applies to both mouse modes.
+Windows' pointer speed setting applies to the touchpad mouse.
 
 ### Couch mode
 
@@ -81,10 +79,16 @@ For using the PC from the sofa with the controller alone:
 | L1 / R1 | Back / forward in a browser |
 | Options | The Start menu |
 
-Couch mode keeps out of games by itself. It goes quiet while a fullscreen program that is not the
-Windows shell or a browser is in front, and whenever the program in front lives in a game folder
-(Steam, Epic, GOG, Xbox, or folders named `Emulation` or `roms`). For a windowed game it cannot
-detect, hold **Create** alone for one second to pause couch mode. Do the same to start it again.
+Couch mode keeps out of games by itself. It goes quiet while the program in front reads a
+controller itself (it has one open, or uses XInput, DirectInput or GameInput), while a fullscreen
+program that is not part of Windows or a browser is in front, and while the program in front runs
+as administrator (keys could not reach it anyway). It does not matter where a program is
+installed. For a windowed game it cannot detect, hold **Create** for one second on the desktop to
+pause couch mode. Do the same to start it again. Holding Create inside a game does not pause it.
+
+When couch mode is ticked but waiting, the tray menu says why in a grey line, for example "Couch
+mode waits: game.exe reads the controller" or "Couch mode paused". Unticking and ticking it again
+always starts it afresh.
 
 It works over Bluetooth without switching the controller to the long report, so other programs
 keep seeing the controller as before.
@@ -135,6 +139,14 @@ a voice command, or, over Bluetooth, before the controller is on the long report
 send Windows notifications (for example Discord with its notifications off) cannot make it buzz.
 It also buzzes while Windows' do-not-disturb hides the banners.
 
+### Hands off the controller while a game is in front
+
+While a game is in front (the same test as couch mode), WinSense sends nothing at all to the
+controller: no trigger effects, rumble, lights, haptics or sounds. Use it for games that drive the
+DualSense themselves, so the two do not fight. Within a second of the game leaving the front, WinSense sends its own state again
+(only if it had sent anything before, or something asked for a change meanwhile). Off unless ticked.
+New in 0.18.0.
+
 ### Turn controller off
 
 Disconnects a Bluetooth controller, which then turns itself off. Press PS to turn it on again.
@@ -144,7 +156,8 @@ No administrator rights are needed.
 
 Turns a Bluetooth controller off after 10 minutes without input. Input means a button, a stick or
 trigger moved, a finger on the touchpad, or the controller being moved. A mod sending effects, an
-effect left on in the test screen, or game sound being played in the grips also count as use. A
+effect left on in the test screen, game sound being played in the grips, or a game holding the
+controller (see Hands off) also count as use. A
 controller on the cable is left on.
 
 ### Start with Windows
@@ -173,12 +186,12 @@ Bluetooth.
 ## Bluetooth and the long report
 
 Over Bluetooth the controller starts with a short report that most programs can read. Triggers,
-lights, haptics, battery, gyro and the touchpad position need the long report, and the controller
+lights, haptics, battery, motion and the touchpad position need the long report, and the controller
 switches to it when a program asks for it. It then stays on the long report until it is turned
 off. Programs that only understand the short report (some browser testers, DirectInput games)
 then stop seeing the controller.
 
-WinSense does not switch on its own. The switch happens when you turn on the touchpad or gyro
+WinSense does not switch on its own. The switch happens when you turn on the touchpad
 mouse, open the test screen, or when a mod or a feature sends something to the controller.
 
 ## Voice commands
@@ -193,7 +206,7 @@ You can start with a name or leave it out: "computer", "jarvis", "yo", "hey" or 
 
 | Say | Does |
 |---|---|
-| open, focus, switch to, close + an app's name | Opens it, brings its window to the front, or closes it. The names are the apps in your Start menu. Close asks the app to close, so it may still ask about unsaved work. |
+| open, focus, switch to, close + an app's name | Opens it, brings its window to the front (moved to the main monitor if it is on another one), or closes it. The names are the apps in your Start menu. Close asks the app to close, so it may still ask about unsaved work. |
 | go to my downloads / documents / desktop / pictures / music / videos (folder) | Opens that folder in Explorer |
 | volume up, louder / volume down, quieter | Changes the volume by a tenth |
 | mute, unmute | Mutes or unmutes the PC's sound |
@@ -202,8 +215,11 @@ You can start with a name or leave it out: "computer", "jarvis", "yo", "hey" or 
 | battery, what's my battery, how much battery | Says roughly how full the battery is |
 | turn off controller, controller off | Turns the controller off |
 | mouse on/off, turn on/off mouse, touchpad on/off | Switches the touchpad mouse |
-| gyro on/off, turn on/off gyro | Switches the gyro mouse |
 | couch mode on/off, turn on/off couch mode | Switches couch mode, the same as its menu item |
+| couch mode | Switches couch mode the other way |
+| move + an app's name + to monitor + a number (up to six) | Moves its window to that monitor, at the same size and place, and brings it to the front. A maximised or full-screen window stays that way. |
+| show two, show monitor two, monitor two (up to six) | Shows that monitor full screen on the main monitor and moves the cursor onto it, so the touchpad or couch mode works the windows there while you watch the main screen. The numbers are Windows' display numbers (Settings > Display). |
+| show main, close, show one | Closes that view and puts the cursor back on the main monitor. In couch mode, Circle does the same. |
 
 Only apps from the Start menu can be opened, and some are never offered: command prompts,
 PowerShell, system tools, installers, uninstallers and scripts.

@@ -131,9 +131,15 @@ impl Watch {
         if let Some((level, state)) = s.battery {
             BATTERY.store(level | state << 4, Ordering::Relaxed);
         }
-        let busy = MODS.load(Ordering::Relaxed) > 0 || EFFECT.load(Ordering::Relaxed) || RESET.swap(false, Ordering::Relaxed);
+        let busy = in_use() || RESET.swap(false, Ordering::Relaxed);
         IDLE_SECS.store(self.0.step(s, busy, Instant::now()).as_secs() as u32, Ordering::Relaxed);
     }
+}
+
+/// A mod connected, an effect or tone on, or game sound playing in the grips: the controller is
+/// in use however still it lies. Counted here, so the idle time starts again when that ends.
+pub fn in_use() -> bool {
+    MODS.load(Ordering::Relaxed) > 0 || EFFECT.load(Ordering::Relaxed) || crate::sound::ACTIVE.load(Ordering::Relaxed)
 }
 
 /// No controller (or a new connection begins): nothing known.
@@ -213,6 +219,16 @@ mod tests {
         let mut i = Idle::new(t0);
         i.step(&short, false, at(0));
         assert_eq!(i.step(&short, false, at(IDLE_LIMIT as u64 + 5)).as_secs(), IDLE_LIMIT as u64 + 5);
+    }
+
+    #[test]
+    fn game_sound_in_the_grips_is_use() {
+        // Once only the tray counted it, so the idle time ran on underneath and the
+        // controller went off the moment a song paused after 10 minutes untouched.
+        crate::sound::ACTIVE.store(true, Ordering::Relaxed);
+        let busy = in_use();
+        crate::sound::ACTIVE.store(false, Ordering::Relaxed);
+        assert!(busy);
     }
 
     #[test]

@@ -167,29 +167,17 @@ fn main() {
     r[4] = 32;
     r[8..12].copy_from_slice(&[0xFF, 0xFF, 0, 0]);
     r[12..16].copy_from_slice(&[0xFF, 0xFF, 0, 0]);
-    let (mut group, mut ico, mut images) = (Vec::new(), Vec::new(), Vec::new());
+    let mut group = Vec::new();
     for (i, &n) in SIZES.iter().enumerate() {
         let img = icon_image(n);
         res(&mut r, 3, i as u16 + 1, 0x1010, &img);
-        let entry = |tail: &[u8]| [&[n as u8, n as u8, 0, 0][..], &1u16.to_le_bytes(), &32u16.to_le_bytes(), &(img.len() as u32).to_le_bytes(), tail].concat();
-        group.extend(entry(&(i as u16 + 1).to_le_bytes()));
-        ico.push(entry(&[]));
-        images.push(img);
+        // GRPICONDIRENTRY: size, size, colours, reserved, planes 1, 32 bits, bytes, resource id.
+        group.extend([&[n as u8, n as u8, 0, 0][..], &1u16.to_le_bytes(), &32u16.to_le_bytes(), &(img.len() as u32).to_le_bytes(), &(i as u16 + 1).to_le_bytes()].concat());
     }
-    let dir = |count: usize| [0u16, 1, count as u16].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-    res(&mut r, 14, 1, 0x1030, &[dir(SIZES.len()), group].concat());
+    let dir: Vec<u8> = [0u16, 1, SIZES.len() as u16].iter().flat_map(|x| x.to_le_bytes()).collect();
+    res(&mut r, 14, 1, 0x1030, &[dir, group].concat());
     res(&mut r, 24, 1, 0x0030, MANIFEST.as_bytes());
     res(&mut r, 16, 1, 0x0030, &version_info());
     std::fs::write(out.join("winsense.res"), &r).unwrap();
-    // The same icon as a .ico file, to look at the drawing (not shipped).
-    let mut f = dir(SIZES.len());
-    let mut offset = 6 + 16 * SIZES.len() as u32;
-    for (e, img) in ico.iter().zip(&images) {
-        f.extend(e);
-        f.extend(offset.to_le_bytes());
-        offset += img.len() as u32;
-    }
-    images.iter().for_each(|i| f.extend(i));
-    std::fs::write(out.join("winsense.ico"), f).unwrap();
     println!("cargo:rustc-link-arg-bins={}", out.join("winsense.res").display());
 }

@@ -65,7 +65,9 @@ pub fn tone_bt(side: Side, hz: u32, level: u8, ms: u32) -> Vec<[i8; 2]> {
 /// two separate tones of 120 ms at 50 % = nothing, two of 200 ms at 100 % = only one, one of 1.5 s =
 /// felt. So each new stream loses its start (guess: the controller fills a buffer first); the
 /// silence in front takes that loss once, and the gap inside one stream is not lost.
-const TAP: (u32, u32, u32) = (150, 150, 130);
+const TAP: (u32, u32, u32) = (LEAD, 150, 130);
+/// Silence in front of a tone that starts a stream, so the loss falls on it.
+pub const LEAD: u32 = 150;
 
 pub fn tap_ms() -> u32 {
     TAP.0 + 2 * TAP.1 + TAP.2
@@ -112,6 +114,9 @@ fn paced(devs: &[hidapi::HidDevice], n: usize, tail: usize, keep: &mut dyn FnMut
     let (mut sent, mut late) = (0, 0);
     let mut result = Ok(());
     for k in 0..n + tail {
+        if crate::ui::RELEASED.load(std::sync::atomic::Ordering::Relaxed) {
+            break; // a game holds the controller: not even a closing report lands in its stream
+        }
         if k < n && !keep() {
             let _ = devs.iter().try_for_each(|d| d.write(&make(n)).map(drop));
             break;
@@ -272,6 +277,7 @@ mod tests {
 
     #[test]
     fn bt_stream_paces_and_stops() {
+        let _one = crate::ui::tests::HOLDS.lock().unwrap();
         let frames = tone_bt(Side::Both, 80, 50, 300); // 900 frames = 29 reports, then 3 silent
         let t = std::time::Instant::now();
         let (sent, late) = play_bt(&[], &frames, &mut || true).unwrap();

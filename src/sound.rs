@@ -13,9 +13,9 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use windows::Win32::Foundation::E_FAIL;
+use windows::Win32::Foundation::{E_ABORT, E_FAIL};
 use windows::Win32::Media::Audio::*;
-use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance, CoTaskMemFree};
+use windows::Win32::System::Com::{CLSCTX_ALL, CoTaskMemFree};
 use windows::core::{Error, Result};
 
 /// The tray's toggle "Game sound as haptics": off unless ticked.
@@ -116,6 +116,9 @@ impl Feed {
 
     /// One captured frame.
     pub fn push(&mut self, l: f32, r: f32) {
+        // A NaN or infinity would stay in the filters for good and leave the grips silent.
+        let finite = |v: f32| if v.is_finite() { v } else { 0.0 };
+        let (l, r) = (finite(l), finite(r));
         self.loud = self.loud.max(l.abs()).max(r.abs());
         let mut y = [l as f64, r as f64];
         for (y, f) in y.iter_mut().zip(&mut self.filters) {
@@ -186,13 +189,13 @@ struct Capture {
     cap: IAudioCaptureClient,
     id: String,
     channels: usize,
+    lfe: Option<usize>, // index of the bass channel, from the channel mask
 }
 
 /// The default playback device and its endpoint id.
 fn default_device() -> Result<(IMMDevice, String)> {
+    let dev = crate::voice::default_device(eRender)?;
     unsafe {
-        let en: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let dev = en.GetDefaultAudioEndpoint(eRender, eConsole)?;
         let p = dev.GetId()?;
         let id = p.to_string().unwrap_or_default();
         CoTaskMemFree(Some(p.0 as _));
@@ -200,25 +203,28 @@ fn default_device() -> Result<(IMMDevice, String)> {
     }
 }
 
-const OWN_DEVICE: &str = "the controller's own speaker is the default sound device";
+/// `listen`'s error code for the controller's own speaker (told apart by code, not by text).
+const OWN_DEVICE: windows::core::HRESULT = E_ABORT;
 
 /// Start listening to what `dev` plays, in its own mix format. Returns the capture and its rate.
 fn listen(dev: &IMMDevice, id: String) -> Result<(Capture, u32)> {
     if crate::audio::is_dualsense(&id) {
-        return Err(Error::new(E_FAIL, OWN_DEVICE)); // never the controller's own sound (it would feed itself)
+        return Err(Error::new(OWN_DEVICE, "the controller's own speaker is the default sound device")); // never the controller's own sound (it would feed itself)
     }
     unsafe {
         let client: IAudioClient = dev.Activate(CLSCTX_ALL, None)?;
         let p = client.GetMixFormat()?;
         let f = p.read_unaligned();
         // 3 = IEEE float, as the tag or as the first field of the extensible sub-format.
-        let float = f.wBitsPerSample == 32 && (f.wFormatTag == 3 || f.wFormatTag == 0xFFFE && (p as *const WAVEFORMATEXTENSIBLE).read_unaligned().SubFormat.data1 == 3);
+        let ext = (f.wFormatTag == 0xFFFE).then(|| (p as *const WAVEFORMATEXTENSIBLE).read_unaligned());
+        let float = f.wBitsPerSample == 32 && (f.wFormatTag == 3 || ext.is_some_and(|x| x.SubFormat.data1 == 3));
+        let lfe = ext.and_then(|x| lfe_index(x.dwChannelMask));
         let r = if float { client.Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK, 2_000_000, 0, p, None) } else { Err(Error::new(E_FAIL, "the sound device's mix format is not 32-bit float")) };
         CoTaskMemFree(Some(p as _));
         r?;
         let cap: IAudioCaptureClient = client.GetService()?;
         client.Start()?;
-        Ok((Capture { _client: client, cap, id, channels: f.nChannels as usize }, f.nSamplesPerSec))
+        Ok((Capture { _client: client, cap, id, channels: f.nChannels as usize, lfe }, f.nSamplesPerSec))
     }
 }
 
@@ -257,7 +263,7 @@ impl Stream {
             let dev = default_device();
             if !matches!((&dev, &self.cap), (Ok(d), Some(c)) if d.1 == c.id) {
                 let r = dev.and_then(|(dev, id)| listen(&dev, id));
-                let own = matches!(&r, Err(e) if e.message() == OWN_DEVICE);
+                let own = matches!(&r, Err(e) if e.code() == OWN_DEVICE);
                 if own && !self.own {
                     *crate::voice::NOTE.lock().unwrap() = Some("Game sound as haptics is paused: the controller's own speaker is the default sound device.");
                 }
@@ -283,7 +289,7 @@ impl Stream {
         // Rule: rumble wins. Report 0x32 is not felt while emulated rumble is on (measured), so
         // while the worker drives a motor (test screen, mod, game through the opt-in pad) the
         // stream waits; and it waits while the mic listens (a buzz in the grips is noise in it).
-        let (open, rumble, mic) = (self.feed.open(), crate::ui::RUMBLE.load(Ordering::Relaxed), crate::ds::MIC.load(Ordering::Relaxed));
+        let (open, rumble, mic) = (self.feed.open(), crate::ui::SENT_MOTORS.load(Ordering::Relaxed) != 0, crate::ds::MIC.load(Ordering::Relaxed));
         let w = &mut self.feed.stats.waits;
         w[0] += !open as u32;
         w[1] += rumble as u32;
@@ -303,6 +309,23 @@ impl Stream {
     }
 }
 
+/// Where the LFE (bass) channel sits: channels come in mask-bit order, so it follows the ones
+/// below it (front left, front right, centre). None when the layout has no LFE.
+fn lfe_index(mask: u32) -> Option<usize> {
+    (mask & 0x8 != 0).then(|| (mask & 0x7).count_ones() as usize)
+}
+
+/// One frame of the mix as left and right. Surround layouts (2.1, 5.1, 7.1) carry most of a
+/// game's bass in the LFE channel, so it goes to both grips.
+fn stereo(f: &[f32], lfe: Option<usize>) -> (f32, f32) {
+    let bass = lfe.and_then(|i| f.get(i)).copied().unwrap_or(0.0);
+    match f.len() {
+        0 => (0.0, 0.0),
+        1 => (f[0], f[0]),
+        _ => (f[0] + bass, f[1] + bass),
+    }
+}
+
 /// Feed every waiting packet; the number of frames taken in.
 fn drain(c: &Capture, feed: &mut Feed) -> Result<u32> {
     let mut total = 0;
@@ -314,7 +337,10 @@ fn drain(c: &Capture, feed: &mut Feed) -> Result<u32> {
                 (0..n).for_each(|_| feed.push(0.0, 0.0));
             } else {
                 let s = std::slice::from_raw_parts(data as *const f32, n as usize * c.channels);
-                s.chunks_exact(c.channels).for_each(|f| feed.push(f[0], f[(c.channels > 1) as usize]));
+                s.chunks_exact(c.channels).for_each(|f| {
+                    let (l, r) = stereo(f, c.lfe);
+                    feed.push(l, r)
+                });
             }
             c.cap.ReleaseBuffer(n)?;
             total += n;
@@ -430,6 +456,27 @@ mod tests {
         assert!(feed.open());
         feed.lull(); // 469 reports' time with nothing captured = 5 s
         assert!(!feed.open(), "nothing playing at all closes it too");
+    }
+
+    #[test]
+    fn surround_bass_and_bad_samples() {
+        assert_eq!(stereo(&[0.1], None), (0.1, 0.1), "mono to both grips");
+        assert_eq!(stereo(&[0.1, 0.2, 0.3, 0.4], lfe_index(0x33)), (0.1, 0.2), "quad: no LFE, the front pair");
+        assert_eq!(stereo(&[0.1, 0.2, 0.0, 0.5, 0.0, 0.0], lfe_index(0x3F)), (0.6, 0.7), "5.1: the LFE in both");
+        assert_eq!(lfe_index(0x60F), Some(3), "5.1 side and 7.1 too");
+        assert_eq!(lfe_index(0x0B), Some(2), "2.1: right after the front pair");
+        assert_eq!(lfe_index(0), None, "no layout (a multi-output card): nothing added");
+        // One NaN from a driver must not leave the filters silent for good.
+        let mut feed = Feed::new(48_000);
+        feed.push(f32::NAN, f32::INFINITY);
+        let mut out = Vec::new();
+        for i in 0..48_000u32 {
+            feed.push(0.2 * (std::f32::consts::TAU * 60.0 * i as f32 / 48_000.0).sin(), 0.0);
+            if feed.queue.len() >= 32 {
+                out.extend(feed.take());
+            }
+        }
+        assert!(peak(&out[1500..], 0) >= 120, "bass still comes through");
     }
 
     #[test]

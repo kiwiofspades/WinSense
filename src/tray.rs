@@ -1,27 +1,20 @@
 //! The tray program: `winsense` with no arguments. No console window; an icon in the
-//! notification area whose menu opens the trigger test screen (src/ui.rs, same process, same
-//! worker), switches the touchpad and gyro mouse, turns a Bluetooth controller off, sets
-//! "start with Windows" (a per-user Run entry) and quits. The mouse (src/mouse.rs) runs the
-//! whole time and reads only. Quitting closes the screen and ends the worker, which switches
-//! triggers and rumble off if anything was ever sent. One tray per user session (a named mutex);
-//! while it runs, the CLI commands that write or move the mouse refuse (`claim`).
-//! Since 0.8.0 it also runs the mod port (src/port.rs): game mods send effects through a named pipe.
-//! Since 0.10.0 it also runs the voice thread (src/voice.rs): dings and the hold-Mute voice command.
-//! Since 0.9.1, when a controller connected by Bluetooth is plugged in by cable too, it drops the
-//! Bluetooth link, so the controller runs on the cable alone (cable haptics are not felt while
-//! Bluetooth is up; measured) without turning the PC's Bluetooth off.
-//! Since 0.11.0 the tooltip and the menu show the battery, a balloon warns once per discharge when
-//! it is low, and "Turn off when idle" (off unless ticked) switches a Bluetooth controller off
-//! after 10 minutes without input (src/power.rs holds the rules).
-//! Since 0.12.0 "Game sound as haptics" (off unless ticked) plays the low end of what Windows plays
-//! in the grips (src/sound.rs).
-//! Since 0.15.0 "Mute light follows PC mic" and "Buzz on notifications" (off unless ticked, src/desk.rs).
+//! notification area with the battery in its tip, and a menu: the trigger test screen (src/ui.rs,
+//! same process, same worker), the touchpad mouse, couch mode, game sound as haptics (src/sound.rs),
+//! mute light and notification buzz (src/desk.rs), turn the controller off now or when idle
+//! (src/power.rs holds the rules), start with Windows (a per-user Run entry), updates, quit.
+//! It starts the mouse thread (src/mouse.rs, reads only; it also runs couch mode), the voice
+//! thread (src/voice.rs), the desk thread and the mod port (src/port.rs). When a controller
+//! connected by Bluetooth is plugged in by cable too, it drops the Bluetooth link, so the
+//! controller runs on the cable alone (cable haptics are not felt while Bluetooth is up; measured).
+//! Quitting closes the screen and ends the worker, which switches triggers and rumble off if
+//! anything was ever sent. One tray per user session (a named mutex); while it runs, the CLI
+//! commands that write or move the mouse refuse (`claim`).
 
 use crate::{mouse, power, ui};
-use std::cell::Cell;
 use std::ptr::{null, null_mut};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
 use windows_sys::Win32::Devices::Bluetooth::*;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::IO::DeviceIoControl;
@@ -36,7 +29,6 @@ use windows_sys::w;
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_SCREEN: usize = 1;
 const ID_TOUCH: usize = 2;
-const ID_GYRO: usize = 3;
 pub const ID_OFF: usize = 4;
 const ID_AUTOSTART: usize = 5;
 const ID_QUIT: usize = 6;
@@ -46,10 +38,13 @@ pub const ID_COUCH: usize = 9;
 const ID_MICLIGHT: usize = 10;
 const ID_BUZZ: usize = 11;
 const ID_UPDATE: usize = 12;
+const ID_HANDS: usize = 13;
 /// WinSense's own settings (per user), DWORDs: `IdleOff` = "Turn off when idle" is ticked,
 /// `SoundHaptics` = "Game sound as haptics" is ticked, `Couch` = "Couch mode" is ticked,
-/// `MicLight` = "Mute light follows PC mic", `Buzz` = "Buzz on notifications".
+/// `MicLight` = "Mute light follows PC mic", `Buzz` = "Buzz on notifications",
+/// `HandsOff` = "Hands off the controller while a game is in front".
 const SETTINGS_KEY: PCWSTR = w!("Software\\WinSense");
+const TIMER_TICK: usize = 1;
 const TIMER_WIRED: usize = 2;
 /// WM_DEVICECHANGE's "a device arrived or left" (dbt.h), sent to every top-level window.
 const DBT_DEVNODES_CHANGED: usize = 7;
@@ -61,6 +56,8 @@ static STOP: AtomicBool = AtomicBool::new(false);
 /// The real tray: hand a plugged-in controller over to the cable, switch an idle one off, keep
 /// settings in the registry (off in dry runs and tests: those act on the controller or on the user's settings).
 static WIRED: AtomicBool = AtomicBool::new(false);
+/// "Hands off the controller while a game is in front" (src/port.rs `hold`): off unless ticked.
+static HANDS_ON: AtomicBool = AtomicBool::new(false);
 /// "Turn off when idle": off unless ticked.
 static IDLE_ON: AtomicBool = AtomicBool::new(false);
 static POWER: Mutex<(power::Warn, power::IdleOff)> = Mutex::new((power::Warn(false), power::IdleOff(false)));
@@ -73,14 +70,15 @@ static SHOWN: AtomicU32 = AtomicU32::new(u32::MAX);
 static UPDATES: AtomicBool = AtomicBool::new(false);
 static LAST_LOOK: AtomicU32 = AtomicU32::new(0);
 const RETRY: u32 = 15 * 60; // seconds before a failed update look is tried again
+const DAY: u32 = 24 * 3600; // between update looks
 static LOOKING: AtomicBool = AtomicBool::new(false);
 static LOOKED: Mutex<Option<(bool, Result<Option<crate::update::Release>, String>)>> = Mutex::new(None);
 static OFFER: Mutex<Option<crate::update::Release>> = Mutex::new(None);
 static ASKING: AtomicBool = AtomicBool::new(false);
 static DRY: AtomicBool = AtomicBool::new(false);
-thread_local! {
-    static ICON: Cell<HICON> = const { Cell::new(null_mut()) };
-}
+/// The tray icon; a static, not thread-local: balloons also come from the cable-handover and
+/// update threads, and a null icon there blanked the tray icon.
+static ICON: AtomicPtr<core::ffi::c_void> = AtomicPtr::new(null_mut());
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain([0]).collect()
@@ -126,20 +124,28 @@ fn dark_menus() {
     }
 }
 
+/// What the tip depends on: bits 0-7 mouse::STATE, 8-15 the battery byte, 16 the touchpad switch.
 fn shown() -> u32 {
-    let flag = |f: &AtomicBool, bit: u32| (f.load(Ordering::Relaxed) as u32) << bit;
-    mouse::STATE.load(Ordering::Relaxed) as u32 | (power::BATTERY.load(Ordering::Relaxed) as u32) << 8 | flag(&mouse::TOUCH_ON, 16) | flag(&mouse::GYRO_ON, 17)
+    mouse::STATE.load(Ordering::Relaxed) as u32 | (power::BATTERY.load(Ordering::Relaxed) as u32) << 8 | (mouse::TOUCH_ON.load(Ordering::Relaxed) as u32) << 16
 }
 
 /// The first line of the tip and the menu. `state` = mouse::STATE: 2 only means the full report is
-/// read, so whether the mouse is on comes from the touchpad and gyro switches.
-fn status(state: u8, touch: bool, gyro: bool) -> &'static str {
-    match (state, touch, gyro) {
-        (0, ..) => "No DualSense connected",
-        (1, ..) | (_, false, false) => "Mouse off (hold the touchpad down to turn it on)",
-        (_, true, true) => "Touchpad and gyro mouse on",
-        (_, true, false) => "Touchpad mouse on",
-        _ => "Gyro mouse on",
+/// read, so whether the mouse is on comes from the touchpad switch.
+fn status(state: u8, touch: bool) -> &'static str {
+    match (state, touch) {
+        (0, _) => "No DualSense connected",
+        (1, _) | (_, false) => "Mouse off (hold the touchpad down to turn it on)",
+        _ => "Touchpad mouse on",
+    }
+}
+
+/// A grey menu line when couch mode is ticked but not acting, so a quiet or paused couch mode
+/// is never a mystery. `why` = couch::WHY, `exe` = couch::IN_FRONT (which program and why).
+fn couch_line(why: u8, exe: &str) -> Option<String> {
+    match why {
+        crate::couch::QUIET => Some(format!("Couch mode waits: {}", if exe.is_empty() { "a game is in front" } else { exe })),
+        crate::couch::PAUSED => Some("Couch mode paused (hold Create 1 second to resume)".into()),
+        _ => None,
     }
 }
 
@@ -153,8 +159,8 @@ fn battery_line(state: u8, b: Option<(u8, u8)>) -> Option<String> {
     }
 }
 
-fn tip(state: u8, touch: bool, gyro: bool, b: Option<(u8, u8)>) -> String {
-    let first = format!("WinSense: {}", status(state, touch, gyro));
+fn tip(state: u8, touch: bool, b: Option<(u8, u8)>) -> String {
+    let first = format!("WinSense: {}", status(state, touch));
     battery_line(state, b).map_or(first.clone(), |b| format!("{first}\n{b}"))
 }
 
@@ -167,9 +173,9 @@ fn notify(h: HWND, msg: NOTIFY_ICON_MESSAGE, info: Option<&str>) -> bool {
     d.uID = 1;
     d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     d.uCallbackMessage = WM_TRAY;
-    d.hIcon = ICON.get();
+    d.hIcon = ICON.load(Ordering::Relaxed);
     let copy = |dst: &mut [u16], s: &str| s.encode_utf16().take(dst.len() - 1).enumerate().for_each(|(i, c)| dst[i] = c);
-    copy(&mut d.szTip, &tip(state as u8, state >> 16 & 1 != 0, state >> 17 & 1 != 0, power::battery()));
+    copy(&mut d.szTip, &tip(state as u8, state >> 16 & 1 != 0, power::battery()));
     if let Some(text) = info {
         d.uFlags |= NIF_INFO;
         d.dwInfoFlags = NIIF_INFO;
@@ -187,7 +193,8 @@ fn notify(h: HWND, msg: NOTIFY_ICON_MESSAGE, info: Option<&str>) -> bool {
 /// not be ready), keep the tip in step with the mouse and the battery, warn when the battery is
 /// low, and switch an idle controller off if that is ticked.
 fn tick(h: HWND) {
-    let in_use = power::MODS.load(Ordering::Relaxed) > 0 || power::EFFECT.load(Ordering::Relaxed) || crate::sound::ACTIVE.load(Ordering::Relaxed);
+    crate::port::hold(HANDS_ON.load(Ordering::Relaxed) && crate::couch::gate());
+    let in_use = ui::RELEASED.load(Ordering::Relaxed) || power::MODS.load(Ordering::Relaxed) > 0 || power::EFFECT.load(Ordering::Relaxed) || crate::sound::ACTIVE.load(Ordering::Relaxed);
     let (low, idle) = {
         let mut p = POWER.lock().unwrap();
         (p.0.step(power::battery()), p.1.due(IDLE_ON.load(Ordering::Relaxed) && !in_use, power::IDLE_SECS.load(Ordering::Relaxed)))
@@ -204,6 +211,9 @@ fn tick(h: HWND) {
     }
     if let Some(text) = crate::voice::NOTE.lock().unwrap().take() {
         notify(h, NIM_MODIFY, Some(text)); // why voice refused (src/voice.rs)
+    }
+    if let Some(text) = crate::port::trouble() {
+        notify(h, NIM_MODIFY, Some(&text));
     }
     updates(h);
     let was = SHOWN.load(Ordering::Relaxed);
@@ -232,7 +242,7 @@ fn look(manual: bool) {
             }
         } else {
             // no network yet (logon) or GitHub down: look again in 15 minutes, not in 24 hours
-            LAST_LOOK.store(now().saturating_sub(24 * 3600 - RETRY), Ordering::Relaxed);
+            LAST_LOOK.store((now() + RETRY).saturating_sub(DAY), Ordering::Relaxed); // looks again in RETRY
         }
         *LOOKED.lock().unwrap() = Some((manual, r));
         LOOKING.store(false, Ordering::Relaxed);
@@ -241,7 +251,7 @@ fn look(manual: bool) {
 
 /// From the tick: look once a day, and act on what a look found.
 fn updates(h: HWND) {
-    if UPDATES.load(Ordering::Relaxed) && now().saturating_sub(LAST_LOOK.load(Ordering::Relaxed)) >= 24 * 3600 {
+    if UPDATES.load(Ordering::Relaxed) && now().saturating_sub(LAST_LOOK.load(Ordering::Relaxed)) >= DAY {
         look(false);
     }
     if ASKING.load(Ordering::Relaxed) {
@@ -338,8 +348,7 @@ fn set_autostart(on: bool) -> u32 {
 }
 
 fn setting(name: PCWSTR) -> bool {
-    let (mut v, mut size) = (0u32, 4u32);
-    unsafe { RegGetValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name, RRF_RT_REG_DWORD, null_mut(), &mut v as *mut u32 as _, &mut size) == 0 && v != 0 }
+    dword(name) != 0
 }
 
 fn set_dword(name: PCWSTR, v: u32) -> u32 {
@@ -352,10 +361,6 @@ fn dword(name: PCWSTR) -> u32 {
     v
 }
 
-fn set_setting(name: PCWSTR, on: bool) -> u32 {
-    let v = on as u32;
-    unsafe { RegSetKeyValueW(HKEY_CURRENT_USER, SETTINGS_KEY, name, REG_DWORD, &v as *const u32 as _, 4) }
-}
 
 /// The Bluetooth addresses of the connected DualSenses: (by Bluetooth, by cable). Bluetooth: the
 /// HID serial (e.g. 0123456789ab). Cable: the serial is empty, so feature report 0x09.
@@ -437,19 +442,23 @@ fn show_menu(h: HWND) {
         let m = CreatePopupMenu();
         let item = |flags: u32, id: usize, text: &str| AppendMenuW(m, flags, id, wide(text).as_ptr());
         let check = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
-        let state = mouse::STATE.load(Ordering::Relaxed).min(2);
-        item(MF_STRING | MF_GRAYED, 0, status(state, mouse::TOUCH_ON.load(Ordering::Relaxed), mouse::GYRO_ON.load(Ordering::Relaxed)));
+        let state = mouse::STATE.load(Ordering::Relaxed);
+        item(MF_STRING | MF_GRAYED, 0, status(state, mouse::TOUCH_ON.load(Ordering::Relaxed)));
         if let Some(b) = battery_line(state, power::battery()) {
             item(MF_STRING | MF_GRAYED, 0, &b);
+        }
+        let in_front = crate::couch::IN_FRONT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(c) = couch_line(crate::couch::WHY.load(Ordering::Relaxed), &in_front) {
+            item(MF_STRING | MF_GRAYED, 0, &c);
         }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, ID_SCREEN, "Trigger test screen");
         item(MF_STRING | check(mouse::TOUCH_ON.load(Ordering::Relaxed)), ID_TOUCH, "Touchpad mouse");
-        item(MF_STRING | check(mouse::GYRO_ON.load(Ordering::Relaxed)), ID_GYRO, "Gyro mouse");
         item(MF_STRING | check(crate::couch::ON.load(Ordering::Relaxed)), ID_COUCH, "Couch mode");
         item(MF_STRING | check(crate::sound::ON.load(Ordering::Relaxed)), ID_SOUND, "Game sound as haptics");
         item(MF_STRING | check(crate::desk::LIGHT_ON.load(Ordering::Relaxed)), ID_MICLIGHT, "Mute light follows PC mic");
         item(MF_STRING | check(crate::desk::BUZZ_ON.load(Ordering::Relaxed)), ID_BUZZ, "Buzz on notifications");
+        item(MF_STRING | check(HANDS_ON.load(Ordering::Relaxed)), ID_HANDS, "Hands off the controller while a game is in front");
         item(MF_STRING, ID_OFF, "Turn controller off");
         item(MF_STRING | check(IDLE_ON.load(Ordering::Relaxed)), ID_IDLE, &format!("Turn off when idle ({} minutes)", power::IDLE_LIMIT / 60));
         AppendMenuW(m, MF_SEPARATOR, 0, null());
@@ -466,62 +475,43 @@ fn show_menu(h: HWND) {
 }
 
 fn command(h: HWND, id: usize) {
-    let toggle = |flag: &AtomicBool| {
-        if !flag.fetch_xor(true, Ordering::Relaxed) {
-            mouse::WAKE.store(true, Ordering::Relaxed); // switching one on from the menu = use it now
-        }
-    };
-    // A toggle kept in the registry (the real tray only): flip it, say so if it cannot be remembered.
+    // A switch kept in the registry (the real tray only): flip it, say so if it cannot be remembered.
     let remembered = |flag: &AtomicBool, name: PCWSTR, label: &str| {
         let on = !flag.fetch_xor(true, Ordering::Relaxed);
-        let err = if WIRED.load(Ordering::Relaxed) { set_setting(name, on) } else { 0 };
+        let err = if WIRED.load(Ordering::Relaxed) { set_dword(name, on as u32) } else { 0 };
         if err != 0 {
             notify(h, NIM_MODIFY, Some(&format!("\"{label}\" is {} until WinSense quits, but could not be remembered (error {err}).", if on { "on" } else { "off" })));
         }
+        on
     };
     match id {
-        ID_MICLIGHT => remembered(&crate::desk::LIGHT_ON, w!("MicLight"), "Mute light follows PC mic"),
-        ID_BUZZ => remembered(&crate::desk::BUZZ_ON, w!("Buzz"), "Buzz on notifications"),
-        ID_SCREEN => {
-            ui::open();
-        }
-        ID_UPDATE => look(true),
-        ID_TOUCH => toggle(&mouse::TOUCH_ON),
-        ID_GYRO => toggle(&mouse::GYRO_ON),
-        ID_OFF => {
-            notify(h, NIM_MODIFY, Some(&controller_off()));
-        }
-        ID_AUTOSTART => {
-            let err = set_autostart(!autostart());
-            if err != 0 {
-                notify(h, NIM_MODIFY, Some(&format!("Could not change \"Start with Windows\" (error {err}).")));
-            }
+        ID_MICLIGHT => _ = remembered(&crate::desk::LIGHT_ON, w!("MicLight"), "Mute light follows PC mic"),
+        ID_BUZZ => _ = remembered(&crate::desk::BUZZ_ON, w!("Buzz"), "Buzz on notifications"),
+        ID_COUCH => _ = remembered(&crate::couch::ON, w!("Couch"), "Couch mode"),
+        ID_HANDS => _ = remembered(&HANDS_ON, w!("HandsOff"), "Hands off the controller while a game is in front"),
+        ID_SOUND => {
+            remembered(&crate::sound::ON, w!("SoundHaptics"), "Game sound as haptics");
+            crate::port::poke(); // the haptic thread starts or stops listening
         }
         ID_IDLE => {
-            let on = !IDLE_ON.fetch_xor(true, Ordering::Relaxed);
-            if on {
+            if remembered(&IDLE_ON, w!("IdleOff"), "Turn off when idle") {
                 // Count from the tick, not from the last input: ticking it never switches off at once.
                 power::RESET.store(true, Ordering::Relaxed);
                 let _ = power::IDLE_SECS.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| (v != power::NONE).then_some(0));
             }
-            let err = if WIRED.load(Ordering::Relaxed) { set_setting(w!("IdleOff"), on) } else { 0 };
-            if err != 0 {
-                notify(h, NIM_MODIFY, Some(&format!("\"Turn off when idle\" is {} until WinSense quits, but could not be remembered (error {err}).", if on { "on" } else { "off" })));
+        }
+        ID_SCREEN => _ = ui::open(),
+        ID_UPDATE => look(true),
+        ID_TOUCH => {
+            if !mouse::TOUCH_ON.fetch_xor(true, Ordering::Relaxed) {
+                mouse::WAKE.store(true, Ordering::Relaxed); // switching it on from the menu = use it now
             }
         }
-        ID_SOUND => {
-            let on = !crate::sound::ON.fetch_xor(true, Ordering::Relaxed);
-            crate::port::poke(); // the haptic thread starts or stops listening
-            let err = if WIRED.load(Ordering::Relaxed) { set_setting(w!("SoundHaptics"), on) } else { 0 };
+        ID_OFF => _ = notify(h, NIM_MODIFY, Some(&controller_off())),
+        ID_AUTOSTART => {
+            let err = set_autostart(!autostart());
             if err != 0 {
-                notify(h, NIM_MODIFY, Some(&format!("\"Game sound as haptics\" is {} until WinSense quits, but could not be remembered (error {err}).", if on { "on" } else { "off" })));
-            }
-        }
-        ID_COUCH => {
-            let on = !crate::couch::ON.fetch_xor(true, Ordering::Relaxed);
-            let err = if WIRED.load(Ordering::Relaxed) { set_setting(w!("Couch"), on) } else { 0 };
-            if err != 0 {
-                notify(h, NIM_MODIFY, Some(&format!("\"Couch mode\" is {} until WinSense quits, but could not be remembered (error {err}).", if on { "on" } else { "off" })));
+                notify(h, NIM_MODIFY, Some(&format!("Could not change \"Start with Windows\" (error {err}).")));
             }
         }
         ID_QUIT => unsafe {
@@ -560,13 +550,16 @@ unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRES
             });
             0
         }
-        WM_TIMER => {
+        WM_TIMER if w == TIMER_TICK => {
             tick(h);
             0
         }
         // A device came or went: look 1.5 s after the last change (plugging in sends a burst).
-        WM_DEVICECHANGE if w == DBT_DEVNODES_CHANGED && WIRED.load(Ordering::Relaxed) => {
-            unsafe { SetTimer(h, TIMER_WIRED, 1500, None) };
+        WM_DEVICECHANGE if w == DBT_DEVNODES_CHANGED => {
+            ui::devices(); // the worker looks for controllers again
+            if WIRED.load(Ordering::Relaxed) {
+                unsafe { SetTimer(h, TIMER_WIRED, 1500, None) };
+            }
             1
         }
         WM_DESTROY => unsafe {
@@ -623,15 +616,16 @@ pub fn run(dry: bool) {
     if !dry {
         crate::desk::LIGHT_ON.store(setting(w!("MicLight")), Ordering::Relaxed);
         crate::desk::BUZZ_ON.store(setting(w!("Buzz")), Ordering::Relaxed);
+        HANDS_ON.store(setting(w!("HandsOff")), Ordering::Relaxed);
     }
     let desk = std::thread::spawn(move || crate::desk::run(&STOP, desk, dry)); // mic light and notification buzz
-    ICON.set(icon(true));
+    ICON.store(icon(true), Ordering::Relaxed);
     dark_menus();
     let h = window();
     let keys = crate::osk::create(); // the on-screen keyboard, hidden until couch mode opens it
     tick(h);
     unsafe {
-        SetTimer(h, 1, 1000, None);
+        SetTimer(h, TIMER_TICK, 1000, None);
         if !dry {
             IDLE_ON.store(setting(w!("IdleOff")), Ordering::Relaxed);
             crate::couch::ON.store(setting(w!("Couch")), Ordering::Relaxed);
@@ -646,6 +640,7 @@ pub fn run(dry: bool) {
     }
     STOP.store(true, Ordering::Relaxed);
     let _ = mouse.join(); // lets go of a held mouse button
+    crate::show::close(); // a monitor copy left open: closed, the cursor back on the main monitor
     unsafe { DestroyWindow(keys) };
     let _ = voice.join(); // closes an open mic
     let _ = desk.join(); // puts out a mute light it lit, while the worker is still there
@@ -674,17 +669,18 @@ mod tests {
 
     #[test]
     fn tip_and_menu_show_the_battery() {
-        assert_eq!(tip(0, true, false, Some((8, 0))), "WinSense: No DualSense connected", "nothing stale once the controller is gone");
-        assert_eq!(tip(1, true, false, None), "WinSense: Mouse off (hold the touchpad down to turn it on)\nBattery shows after you hold the touchpad down");
-        assert_eq!(tip(1, true, false, Some((8, 0))), "WinSense: Mouse off (hold the touchpad down to turn it on)\nBattery 85%", "the cable, or someone else switched the report");
-        assert_eq!(tip(2, true, false, Some((3, 1))), "WinSense: Touchpad mouse on\nBattery 35%, charging");
+        assert_eq!(tip(0, true, Some((8, 0))), "WinSense: No DualSense connected", "nothing stale once the controller is gone");
+        assert_eq!(tip(1, true, None), "WinSense: Mouse off (hold the touchpad down to turn it on)\nBattery shows after you hold the touchpad down");
+        assert_eq!(tip(1, true, Some((8, 0))), "WinSense: Mouse off (hold the touchpad down to turn it on)\nBattery 85%", "the cable, or someone else switched the report");
+        assert_eq!(tip(2, true, Some((3, 1))), "WinSense: Touchpad mouse on\nBattery 35%, charging");
         // It once kept saying the mouse was on after it was turned off.
-        assert_eq!(tip(2, false, false, Some((3, 0))), "WinSense: Mouse off (hold the touchpad down to turn it on)\nBattery 35%", "mouse off again: the battery stays");
-        assert_eq!(status(2, false, true), "Gyro mouse on");
-        assert_eq!(status(2, true, true), "Touchpad and gyro mouse on");
+        assert_eq!(tip(2, false, Some((3, 0))), "WinSense: Mouse off (hold the touchpad down to turn it on)\nBattery 35%", "mouse off again: the battery stays");
+        assert_eq!(couch_line(crate::couch::QUIET, "game.exe reads the controller").as_deref(), Some("Couch mode waits: game.exe reads the controller"));
+        assert!(couch_line(crate::couch::PAUSED, "").is_some_and(|l| l.contains("Create")));
+        assert_eq!(couch_line(crate::couch::ACTING, "x.exe"), None);
         assert_eq!(battery_line(2, None).as_deref(), Some("Battery unknown"));
         for b in (0..=10).flat_map(|l| [0, 1, 2, 0xA, 0xF].map(|s| Some((l, s)))) {
-            assert!(tip(1, true, true, b).encode_utf16().count() < 128, "fits the tooltip: {}", tip(1, true, true, b));
+            assert!(tip(1, true, b).encode_utf16().count() < 128, "fits the tooltip: {}", tip(1, true, b));
         }
     }
 
@@ -719,7 +715,7 @@ mod tests {
     #[test]
     fn desk_switches_are_off_until_ticked() {
         let h = window();
-        for (id, flag) in [(ID_MICLIGHT, &crate::desk::LIGHT_ON), (ID_BUZZ, &crate::desk::BUZZ_ON)] {
+        for (id, flag) in [(ID_MICLIGHT, &crate::desk::LIGHT_ON), (ID_BUZZ, &crate::desk::BUZZ_ON), (ID_HANDS, &HANDS_ON)] {
             assert!(!flag.load(Ordering::Relaxed), "off by default");
             unsafe { SendMessageW(h, WM_COMMAND, id, 0) };
             assert!(flag.load(Ordering::Relaxed));
@@ -746,16 +742,13 @@ mod tests {
     fn menu_switches_the_mouse() {
         let h = window();
         assert!(!h.is_null());
-        let (touch, gyro) = (mouse::TOUCH_ON.load(Ordering::Relaxed), mouse::GYRO_ON.load(Ordering::Relaxed));
+        let touch = mouse::TOUCH_ON.load(Ordering::Relaxed);
         mouse::WAKE.store(false, Ordering::Relaxed);
-        unsafe { SendMessageW(h, WM_COMMAND, ID_GYRO, 0) };
-        assert_eq!(mouse::GYRO_ON.load(Ordering::Relaxed), !gyro);
-        assert_eq!(mouse::WAKE.load(Ordering::Relaxed), !gyro, "switching on asks for the full report");
-        unsafe { SendMessageW(h, WM_COMMAND, ID_GYRO, 0) };
         unsafe { SendMessageW(h, WM_COMMAND, ID_TOUCH, 0) };
         assert_eq!(mouse::TOUCH_ON.load(Ordering::Relaxed), !touch);
+        assert_eq!(mouse::WAKE.load(Ordering::Relaxed), !touch, "switching on asks for the full report");
         unsafe { SendMessageW(h, WM_COMMAND, ID_TOUCH, 0) };
-        assert_eq!((mouse::TOUCH_ON.load(Ordering::Relaxed), mouse::GYRO_ON.load(Ordering::Relaxed)), (touch, gyro));
+        assert_eq!(mouse::TOUCH_ON.load(Ordering::Relaxed), touch);
         unsafe { DestroyWindow(h) };
     }
 }

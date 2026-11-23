@@ -112,10 +112,11 @@ fn frame(bt: bool, seq: u8) -> (Vec<u8>, usize) {
 /// Bluetooth: route audio to the built-in speaker and set its volume (LinuxAudio4Dualsense5 and
 /// XephyLon's notes, layout only): valid0 0x20 speaker volume + 0x80 audio control, valid1 0x80
 /// audio control 2; common 5 = volume 0x64, 7 = 0x30 (speaker on), 37 = 2 (pre-gain).
-/// Carries no rumble bits, so it ends a running rumble.
-pub fn speaker_setup(seq: u8) -> Vec<u8> {
+/// `rumble` is the whole current rumble state, so a running rumble goes on.
+pub fn speaker_setup(seq: u8, rumble: Rumble) -> Vec<u8> {
     let (mut r, c) = frame(true, seq);
     (r[c], r[c + 1], r[c + 5], r[c + 7], r[c + 37]) = (0xA0, 0x80, 0x64, 0x30, 2);
+    put_rumble(&mut r, c, rumble);
     let crc = crc32(0xA2, &r[..74]);
     r[74..].copy_from_slice(&crc.to_le_bytes());
     r
@@ -171,6 +172,9 @@ pub enum Effect {
     Off,
     /// Resistance from `start` to the end of the pull. Strength 8 from a point = a wall.
     Resist { start: u8, strength: u8 },
+    /// Resistance from `start` with its own strength per zone (`levels[start..]`; the zones before
+    /// `start` are not read): a gun's pull. The same mode as `Resist`, which is the flat case.
+    Curve { start: u8, levels: [u8; 10] },
     /// Resistance from `start` that gives way at `end`: a gun-trigger click.
     Click { start: u8, end: u8, strength: u8 },
     /// Vibrates while the trigger is held past `start`, `hz` times a second.
@@ -182,16 +186,28 @@ pub enum Effect {
 }
 
 impl Effect {
+    /// A `Curve` from `start` with the given strengths, the last one carried on through zone 9.
+    /// None when there are none, or more than the zones from `start`.
+    pub fn curve(start: u8, given: &[u8]) -> Option<Effect> {
+        let (from, &last) = (start as usize, given.last()?);
+        if from > 9 || given.len() > 10 - from {
+            return None;
+        }
+        let mut levels = [last; 10];
+        levels[from..from + given.len()].copy_from_slice(given);
+        Some(Effect::Curve { start, levels })
+    }
+
     /// The 11-byte effect block (mode, then 10 parameters); None if a value is out of range.
     /// Only modes 0x05, 0x21, 0x25, 0x26 and 0x01 can come out of here. Never 0xFC-0xFE:
     /// those are said to corrupt the trigger until the controller's reset button is pressed.
     pub fn bytes(self) -> Option<[u8; 11]> {
-        // Zone form: a mask of zones start..=9, then ten 3-bit fields holding level - 1.
-        fn zones(mode: u8, start: u8, level: u8) -> [u8; 11] {
+        // Zone form: a mask of zones start..=9, then ten 3-bit fields holding each zone's level - 1.
+        fn zones(mode: u8, start: u8, levels: [u8; 10]) -> [u8; 11] {
             let (mut mask, mut fields) = (0u16, 0u32);
-            for z in start..10 {
+            for z in start as usize..10 {
                 mask |= 1 << z;
-                fields |= (level as u32 - 1) << (3 * z);
+                fields |= (levels[z] as u32 - 1) << (3 * z);
             }
             let mut b = [0u8; 11];
             b[0] = mode;
@@ -202,14 +218,15 @@ impl Effect {
         let level = |s: u8| (1..=8).contains(&s);
         Some(match self {
             Effect::Off => [0x05, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            Effect::Resist { start, strength } if start <= 9 && level(strength) => zones(0x21, start, strength),
+            Effect::Resist { start, strength } if start <= 9 && level(strength) => zones(0x21, start, [strength; 10]),
+            Effect::Curve { start, levels } if start <= 9 && levels[start as usize..].iter().all(|&s| level(s)) => zones(0x21, start, levels),
             Effect::Click { start, end, strength } if (2..=7).contains(&start) && start < end && end <= 8 && level(strength) => {
                 let mask = (1u16 << start | 1 << end).to_le_bytes();
                 [0x25, mask[0], mask[1], strength - 1, 0, 0, 0, 0, 0, 0, 0]
             }
             // start 0 is refused: zone 0 is the released trigger, so it could buzz at rest.
             Effect::Vibrate { start, strength, hz } if (1..=9).contains(&start) && level(strength) && hz > 0 => {
-                let mut b = zones(0x26, start, strength);
+                let mut b = zones(0x26, start, [strength; 10]);
                 b[9] = hz;
                 b
             }
@@ -323,14 +340,14 @@ pub fn with_glow(bt: bool, mut r: Vec<u8>, (bar, players): Glow) -> Vec<u8> {
     seal(bt, r)
 }
 
+/// The controller's mic is wanted open (src/voice.rs); read by every audio report (0x32).
+pub static MIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Bluetooth haptics: report 0x32, 142 bytes (this controller's Bluetooth descriptor; SAxense
 /// on Linux sends 141). Packet 0x11 (session header: mic closed, `counter`) then packet 0x12:
 /// 32 stereo frames of signed 8-bit samples at 3000 Hz (left, right), so one report per
 /// 10.67 ms. Layout from SAxense (egormanga, https://apps.sdore.me/SAxense) and PadForge,
 /// layout only.
-/// The controller's mic is wanted open (src/voice.rs); read by every audio report (0x32).
-pub static MIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub fn haptic_report(seq: u8, counter: u8, frames: &[[i8; 2]]) -> Vec<u8> {
     let mut r = vec![0u8; 142];
     r[0] = 0x32;
@@ -480,6 +497,19 @@ mod tests {
         assert_eq!(b(Effect::Resist { start: 4, strength: 6 }), [0x21, 0xF0, 0x03, 0x00, 0xD0, 0xB6, 0x2D, 0, 0, 0, 0]);
         assert_eq!(b(Effect::Resist { start: 0, strength: 8 }), [0x21, 0xFF, 0x03, 0xFF, 0xFF, 0xFF, 0x3F, 0, 0, 0, 0]);
         assert_eq!(b(Effect::Resist { start: 4, strength: 2 }), [0x21, 0xF0, 0x03, 0x00, 0x90, 0x24, 0x09, 0, 0, 0, 0]);
+        // A curve: one strength per zone; flat, it is the same block as Resist (the game's own vector too).
+        let c = |start, given: &[u8]| b(Effect::curve(start, given).unwrap());
+        assert_eq!(c(4, &[6]), b(Effect::Resist { start: 4, strength: 6 }));
+        assert_eq!(c(0, &[1, 2, 3, 4, 5, 6, 7, 8]), [0x21, 0xFF, 0x03, 0x88, 0xC6, 0xFA, 0x3F, 0, 0, 0, 0], "the last strength carries on");
+        assert_eq!(c(1, &[2, 2, 3, 4, 5, 6, 7, 8, 8]), [0x21, 0xFE, 0x03, 0x48, 0x34, 0xD6, 0x3F, 0, 0, 0, 0], "a double-action pull");
+        assert_eq!(Effect::curve(0, &[]), None);
+        assert_eq!(Effect::curve(9, &[1, 2]), None, "more strengths than zones");
+        assert_eq!(Effect::curve(10, &[1]), None);
+        assert_eq!(Effect::curve(3, &[1, 9]).unwrap().bytes(), None);
+        assert_eq!(Effect::curve(3, &[0]).unwrap().bytes(), None);
+        let mut levels = [0; 10];
+        levels[5..].fill(3);
+        assert!(Effect::Curve { start: 5, levels }.bytes().is_some(), "zones before the start are not read");
         assert_eq!(b(Effect::Click { start: 3, end: 5, strength: 6 }), [0x25, 0x28, 0x00, 0x05, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(b(Effect::Click { start: 2, end: 6, strength: 8 }), [0x25, 0x44, 0x00, 0x07, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(b(Effect::Vibrate { start: 2, strength: 4, hz: 30 }), [0x26, 0xFC, 0x03, 0xC0, 0xB6, 0x6D, 0x1B, 0, 0, 0x1E, 0]);
@@ -560,9 +590,12 @@ mod tests {
         assert_eq!((r[13], r[14], r[75], r[76]), (0xFF, 5, 0x7F, 0x80));
         assert!(r[77..138].iter().all(|&b| b == 0));
         assert_eq!(&r[138..], &crc32(0xA2, &r[..138]).to_le_bytes());
-        let su = speaker_setup(1);
+        let su = speaker_setup(1, R0);
         assert_eq!((su.len(), su[0], su[1], su[2], su[3], su[4], su[8], su[10], su[40]), (78, 0x31, 0x10, 0x10, 0xA0, 0x80, 0x64, 0x30, 2));
         assert_eq!(&su[74..], &crc32(0xA2, &su[..74]).to_le_bytes());
+        let sr = speaker_setup(1, Rumble { left: 150, right: 90, v2: true });
+        assert_eq!((sr[3], sr[5], sr[6], sr[41]), (0xA2, 90, 150, 0x04), "a running rumble goes on: haptics select, motors, v2");
+        assert_eq!(&sr[74..], &crc32(0xA2, &sr[..74]).to_le_bytes());
         let mut opus = [0u8; 200];
         (opus[0], opus[199]) = (0xF4, 7);
         let sp = speaker_report(18, 3, &opus);
